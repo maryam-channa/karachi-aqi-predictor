@@ -10,7 +10,7 @@ class Predictor:
         model_dir = (
             os.environ.get("MODEL_FILES_PATH")
             or os.environ.get("ARTIFACT_FILES_PATH")
-            or "."
+            or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
         )
 
         model_path = os.path.join(
@@ -42,7 +42,7 @@ class Predictor:
             data = inputs.copy()
 
         elif isinstance(inputs, dict):
-            data = pd.DataFrame(inputs)
+            data = pd.DataFrame([inputs])
 
         else:
             data = pd.DataFrame(inputs)
@@ -89,3 +89,5 @@ class Predictor:
         prediction = self.model.predict(data)
 
         return prediction.tolist()
+
+

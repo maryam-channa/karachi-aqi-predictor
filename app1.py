@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import joblib
 import requests
@@ -9,6 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timezone
 import time
+import shap
 
 
 # ============================================================
@@ -1427,6 +1428,10 @@ def process_forecast_data(
         ignore_index=True
     )
 
+    pollutant_df.attrs["shap_features"] = (
+    feature_df[feature_columns].iloc[[0]].copy()
+    )
+
     feature_df.attrs["hourly_predictions"] = predictions_by_timestamp
     feature_df.attrs["selected_dates"] = forecast_dates
     feature_df.attrs["daily_predictions"] = predictions
@@ -1590,11 +1595,9 @@ def create_aqi_chart(
 
     fig.update_layout(
 
-        title="Karachi AQI Forecast — Next 3 Days",
+        
 
-        xaxis_title="Date",
-
-        yaxis_title="AQI (1–5)",
+        xaxis=dict(type="category"),
 
         yaxis=dict(
 
@@ -1668,11 +1671,7 @@ def create_pollutant_chart(
 
     fig.update_layout(
 
-        title="Pollutant Levels",
-
-        xaxis_title="Pollutant",
-
-        yaxis_title="Value (µg/m³)",
+        
 
         plot_bgcolor="rgba(0,0,0,0)",
 
@@ -1726,6 +1725,67 @@ def render_pollutant_card(name, value):
     )
 
 
+def create_shap_explanation(model, feature_row, feature_columns, max_features=12):
+    """
+    Create a SHAP explanation for one Random Forest prediction.
+    Returns a DataFrame containing the most influential features.
+    """
+
+    try:
+
+        if model is None or feature_row is None:
+            return None
+
+        X_explain = pd.DataFrame(
+            feature_row,
+            columns=feature_columns
+        )
+
+        explainer = shap.TreeExplainer(model)
+
+        shap_values = explainer.shap_values(
+            X_explain
+        )
+
+        values = np.asarray(shap_values)
+
+        if values.ndim == 2:
+            values = values[0]
+
+        values = values.astype(float).flatten()
+
+        if len(values) != len(feature_columns):
+            return None
+
+        explanation = pd.DataFrame({
+            "feature": feature_columns,
+            "shap_value": values,
+            "impact": np.abs(values)
+        })
+
+        explanation = (
+            explanation
+            .sort_values(
+                "impact",
+                ascending=False
+            )
+            .head(max_features)
+            .sort_values(
+                "shap_value"
+            )
+        )
+
+        return explanation
+
+    except Exception as e:
+
+        st.warning(
+            f"SHAP explanation unavailable: {e}"
+        )
+
+        return None
+
+
 def main():
 
     st.markdown(
@@ -1735,7 +1795,7 @@ def main():
             <div class="hero-subtitle">
                 Machine-learning powered AQI forecasting for Karachi, Pakistan
             </div>
-            <div class="status-pill">● ML SYSTEM OPERATIONAL</div>
+            <div clas🤖 ML SYSTEM OPERATIONAL</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1794,6 +1854,13 @@ def main():
     current_color = get_aqi_color(current_aqi) if current_aqi is not None else "#94A3B8"
     last_timestamp = latest["timestamp"]
 
+    # Hazardous AQI alert
+    if current_aqi is not None and current_aqi >= 5:
+        st.error(
+            "🚨 Hazardous AQI Alert: Air quality is Very Poor. "
+            "Consider reducing prolonged outdoor exposure."
+        )
+
     # Current AQI + weather
     left, right = st.columns([0.9, 1.35], gap="large")
 
@@ -1815,7 +1882,7 @@ def main():
 
     with right:
         st.markdown(
-            '<div class="glass-card"><div class="section-title">📍 Karachi — Current Conditions</div>',
+            '<div class="glass-card">🌎 Karachi — Current Conditions</div>',
             unsafe_allow_html=True
         )
 
@@ -1876,7 +1943,6 @@ def main():
 
     chart = create_aqi_chart(predictions, forecast_dates)
     chart.update_layout(
-        title=None,
         margin=dict(l=20, r=20, t=20, b=20),
         showlegend=False,
         hovermode="x unified"
@@ -1889,6 +1955,100 @@ def main():
         width="stretch",
         config={"displayModeBar": False, "responsive": True}
     )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # SHAP Explainability
+    st.markdown(
+        '<div class="glass-card"><div class="section-title">🔍 Why This Prediction?</div>',
+        unsafe_allow_html=True
+    )
+
+    shap_features = processed_data.attrs.get(
+        "shap_features"
+    )
+
+    shap_explanation = create_shap_explanation(
+        model,
+        shap_features,
+        model_features,
+        max_features=12
+    )
+
+    if shap_explanation is not None and not shap_explanation.empty:
+
+        st.markdown(
+            """
+            <div style="color:#94A3B8;font-size:.85rem;margin-bottom:.8rem;">
+                SHAP shows how the most influential features contributed
+                to the first forecasted AQI value.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        shap_chart = go.Figure()
+
+        shap_chart.add_trace(
+            go.Bar(
+                x=shap_explanation["shap_value"],
+                y=shap_explanation["feature"],
+                orientation="h",
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "SHAP impact: %{x:.4f}"
+                    "<extra></extra>"
+                )
+            )
+        )
+
+        shap_chart.update_layout(
+            height=430,
+            margin=dict(
+                l=20,
+                r=20,
+                t=20,
+                b=20
+            ),
+            xaxis_title="SHAP Value",
+            yaxis_title=None,
+            showlegend=False,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(
+                color="#CBD5E1"
+            )
+        )
+
+        shap_chart.update_xaxes(
+            zeroline=True,
+            zerolinecolor="rgba(148,163,184,.25)",
+            gridcolor="rgba(148,163,184,.10)"
+        )
+
+        shap_chart.update_yaxes(
+            gridcolor="rgba(148,163,184,.06)"
+        )
+
+        st.plotly_chart(
+            shap_chart,
+            width="stretch",
+            config={
+                "displayModeBar": False,
+                "responsive": True
+            }
+        )
+
+        st.caption(
+            "Positive SHAP values push the prediction higher; "
+            "negative values push it lower."
+        )
+
+    else:
+
+        st.info(
+            "SHAP explanation is temporarily unavailable."
+        )
+
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Pollutants
@@ -1907,10 +2067,10 @@ def main():
     with pollutant_cols[3]:
         render_pollutant_card("O₃", current_o3)
 
-    pollutant_chart = create_pollutant_chart(processed_data)
+    pollutant_chart = create_pollutant_chart(pd.DataFrame([{"pm25": current_pm25, "pm10": current_pm10, "no2": current_no2, "o3": current_o3}]))
     if pollutant_chart is not None:
         pollutant_chart.update_layout(
-            title=None,
+            
             margin=dict(l=20, r=20, t=10, b=20),
             showlegend=False
         )
@@ -1987,5 +2147,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
 
 

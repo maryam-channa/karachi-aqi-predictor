@@ -44,3 +44,5 @@ models/registry_gradient_boosting*/
 
 # Local generated files
 *.pickle
+
+test_payload.json

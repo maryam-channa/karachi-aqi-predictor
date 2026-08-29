@@ -7,3 +7,6 @@ plotly>=5.0.0
 pandas-gbq>=0.26.1
 hopsworks==5.0.*
 nest-asyncio>=1.6.0
+shap>=0.46.0
+tensorflow
+flask
