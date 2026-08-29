@@ -6,3 +6,4 @@ pandas-datareader>=0.10.0
 plotly>=5.0.0
 pandas-gbq>=0.26.1
 hopsworks>=3.3.0
+nest-asyncio>=1.6.0
