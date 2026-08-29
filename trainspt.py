@@ -1,4 +1,4 @@
-import os
+﻿import os
 import joblib
 import hopsworks
 import numpy as np
@@ -104,7 +104,7 @@ def main():
         host=HOPSWORKS_HOST,
         project=HOPSWORKS_PROJECT,
         api_key_value=HOPSWORKS_API_KEY,
-        engine="python"
+
     )
 
     print(f"Connected to project: {project.name}")
@@ -379,7 +379,7 @@ def main():
     )
 
     print(
-        f"Test R²:    {rf_test_r2:.6f}"
+        f"Test RÂ²:    {rf_test_r2:.6f}"
     )
 
     # --------------------------------------------------------
@@ -441,7 +441,7 @@ def main():
     )
 
     print(
-        f"Test R²:    {gbr_test_r2:.6f}"
+        f"Test RÂ²:    {gbr_test_r2:.6f}"
     )
 
     # --------------------------------------------------------
@@ -497,7 +497,7 @@ def main():
     )
 
     print(
-        f"R²: {best_row['r2']:.6f}"
+        f"RÂ²: {best_row['r2']:.6f}"
     )
 
     # --------------------------------------------------------
@@ -694,7 +694,7 @@ def main():
     )
 
     print(
-        f"Best R²: "
+        f"Best RÂ²: "
         f"{best_row['r2']:.6f}"
     )
 
