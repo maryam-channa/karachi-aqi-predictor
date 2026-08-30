@@ -15,7 +15,7 @@ class Predictor:
 
         model_path = os.path.join(
             model_dir,
-            "random_forest_model.pkl"
+            "gradient_boosting_model.pkl"
         )
 
         self.model = joblib.load(model_path)
@@ -27,7 +27,7 @@ class Predictor:
             )
 
         print(
-            "Karachi AQI Random Forest loaded successfully."
+            "Karachi AQI Gradient Boosting loaded successfully."
         )
 
     def predict(self, inputs):
