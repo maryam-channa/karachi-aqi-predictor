@@ -6,4 +6,4 @@ pandas-datareader>=0.10.0
 plotly>=5.0.0
 pandas-gbq>=0.26.1
 shap>=0.46.0
-tensorflow
+tensorflow==2.18.0
