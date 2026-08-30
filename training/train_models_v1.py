@@ -1497,6 +1497,116 @@ def save_metadata(
     )
 
 
+
+# ============================================================
+# REGISTER BEST MODEL IN HOPSWORKS MODEL REGISTRY
+# ============================================================
+
+def register_best_model(
+    best_model_name,
+    best_metrics,
+    feature_count,
+):
+    """
+    Register the best fitted sklearn model in Hopsworks.
+    A new model version is created automatically.
+    """
+
+    model_names = {
+        "Ridge Regression": "karachi_aqi_ridge_regression",
+        "Random Forest": "karachi_aqi_random_forest",
+        "Gradient Boosting": "karachi_aqi_gradient_boosting",
+    }
+
+    model_files = {
+        "Ridge Regression": (
+            MODEL_DIR / "ridge_model.pkl"
+        ),
+        "Random Forest": (
+            MODEL_DIR / "random_forest_model.pkl"
+        ),
+        "Gradient Boosting": (
+            MODEL_DIR / "gradient_boosting_model.pkl"
+        ),
+    }
+
+    if best_model_name not in model_names:
+        raise RuntimeError(
+            "Unsupported best model for registry registration: "
+            f"{best_model_name}"
+        )
+
+    model_path = model_files[best_model_name]
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Best model artifact was not found: {model_path}"
+        )
+
+    print(
+        "\n============================================================"
+    )
+
+    print(
+        " REGISTERING BEST MODEL IN HOPSWORKS"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    project = connect_hopsworks()
+
+    mr = project.get_model_registry()
+
+    registered_model = mr.python.create_model(
+        name=model_names[best_model_name],
+
+        description=(
+            f"{best_model_name} Karachi AQI prediction "
+            "using 98 engineered features from "
+            f"{FEATURE_VIEW_NAME} v{FEATURE_VIEW_VERSION}."
+        ),
+
+        metrics={
+            "rmse": float(
+                best_metrics["rmse"]
+            ),
+
+            "mae": float(
+                best_metrics["mae"]
+            ),
+
+            "r2": float(
+                best_metrics["r2"]
+            ),
+
+            "feature_count": float(
+                feature_count
+            ),
+        },
+    )
+
+    registered_model.save(
+        str(model_path),
+        keep_original_files=True,
+    )
+
+    print(
+        f"Registered model: {best_model_name}"
+    )
+
+    print(
+        f"Model artifact: {model_path}"
+    )
+
+    print(
+        "Hopsworks Model Registry registration: PASSED"
+    )
+
+    return registered_model
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1801,6 +1911,17 @@ def main():
     )
 
     # --------------------------------------------------------
+    # Register best model
+    # --------------------------------------------------------
+
+    register_best_model(
+        best_model_name,
+        best_metrics,
+        len(feature_columns),
+    )
+
+
+    # --------------------------------------------------------
     # Final summary
     # --------------------------------------------------------
 
@@ -1890,12 +2011,12 @@ def main():
         )
 
     print(
-        "\nNEXT STEP:"
+        "\nMODEL REGISTRY:"
     )
 
     print(
-        "Review the model metrics before registering "
-        "the winning model in Hopsworks Model Registry."
+        "Best model registered successfully in "
+        "Hopsworks Model Registry."
     )
 
 
