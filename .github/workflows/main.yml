@@ -1,4 +1,4 @@
-﻿name: AQI Pipeline
+name: AQI Pipeline
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
 
   feature-pipeline:
     name: Hourly Feature Pipeline
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * *'
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * *'
     runs-on: ubuntu-latest
 
     steps:
@@ -41,7 +41,7 @@ jobs:
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-        run: python featurespt.py
+        run: python feature_pipeline.py
 
   training-pipeline:
     name: Daily Training Pipeline

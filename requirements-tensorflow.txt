@@ -1,9 +1,9 @@
-﻿pandas-stubs>=2.2.2.240909
-numpy>=1.21.0
+pandas-stubs>=2.2.2.240909
+numpy==2.0.2
 scikit-learn>=1.6.0
 pandas>=2.1.4
 pandas-datareader>=0.10.0
 plotly>=5.0.0
 pandas-gbq>=0.26.1
-shap>=0.46.0
+shap==0.51.0
 tensorflow==2.18.0

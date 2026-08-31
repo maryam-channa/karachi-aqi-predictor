@@ -4,11 +4,11 @@ Production AQI feature pipeline for Karachi.
 Purpose
 -------
 1. Fetch the current weather and pollutant observation from OpenWeather.
-2. Append the raw observation to the existing Hopsworks raw feature group
-   (aqi_features, v3).
+2. Append the raw observation to a dedicated persistent Hopsworks raw
+   feature group (aqi_raw_observations, v1).
 3. Maintain a local raw cache at data/historical_aqi.csv.
 4. Build the exact 98-feature schema used by the verified
-   GradientBoostingRegressor.
+   RandomForestRegressor.
 5. Write current, unlabeled 98-feature rows to a separate Hopsworks
    serving feature group: aqi_serving_features, version 1.
 6. Do not fabricate a next-hour target; labels are created retrospectively
@@ -32,10 +32,8 @@ OPENWEATHER_API_KEY
 
 Optional
 --------
-RAW_FEATURE_GROUP_NAME=aqi_features
-RAW_FEATURE_GROUP_VERSION=3
-MODEL_FEATURE_GROUP_NAME=aqi_model_features
-MODEL_FEATURE_GROUP_VERSION=1
+RAW_FEATURE_GROUP_NAME=aqi_raw_observations
+RAW_FEATURE_GROUP_VERSION=1
 CITY_NAME=Karachi
 """
 
@@ -84,13 +82,13 @@ CITY_NAME = os.getenv("CITY_NAME", "Karachi")
 
 RAW_FEATURE_GROUP_NAME = os.getenv(
     "RAW_FEATURE_GROUP_NAME",
-    "aqi_features",
+    "aqi_raw_observations",
 )
 
 RAW_FEATURE_GROUP_VERSION = int(
     os.getenv(
         "RAW_FEATURE_GROUP_VERSION",
-        "3",
+        "1",
     )
 )
 
@@ -350,10 +348,13 @@ def normalize_current_observation(
     components = entry.get("components", {})
     main = entry.get("main", {})
 
-    timestamp = pd.to_datetime(
-        entry.get("dt"),
-        unit="s",
-        utc=True,
+    timestamp = (
+        pd.to_datetime(
+            entry.get("dt"),
+            unit="s",
+            utc=True,
+        )
+        .floor("h")
     )
 
     aqi = main.get("aqi")
@@ -420,10 +421,13 @@ def clean_raw_history(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df[RAW_COLUMNS].copy()
 
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        utc=True,
-        errors="coerce",
+    df["timestamp"] = (
+        pd.to_datetime(
+            df["timestamp"],
+            utc=True,
+            errors="coerce",
+        )
+        .dt.floor("h")
     )
 
     for column in RAW_COLUMNS[1:]:
@@ -477,34 +481,112 @@ def save_local_raw_cache(df: pd.DataFrame) -> None:
     )
 
 
-def read_raw_history_from_hopsworks(fs) -> pd.DataFrame:
+def get_or_create_raw_feature_group(fs):
+    """Get or create the persistent raw hourly observation Feature Group."""
+
+    try:
+        fg = fs.get_feature_group(
+            name=RAW_FEATURE_GROUP_NAME,
+            version=RAW_FEATURE_GROUP_VERSION,
+        )
+
+        if fg is not None:
+            return fg
+
+    except Exception:
+        pass
 
     log(
-        f"Reading recent raw history from Hopsworks "
+        f"Creating raw Feature Group "
+        f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}..."
+    )
+
+    fg = fs.create_feature_group(
+        name=RAW_FEATURE_GROUP_NAME,
+        version=RAW_FEATURE_GROUP_VERSION,
+        description=(
+            "Persistent Karachi hourly raw AQI and pollutant observations "
+            "used for production feature generation."
+        ),
+        primary_key=["id"],
+        event_time="timestamp",
+        online_enabled=False,
+        time_travel_format="DELTA",
+    )
+
+    if fg is None:
+        raise RuntimeError(
+            "Failed to create the persistent raw Feature Group."
+        )
+
+    return fg
+
+
+def write_raw_observation_to_hopsworks(
+    fs,
+    current_row: pd.DataFrame,
+) -> None:
+    """Persist the current raw observation for future hourly runs."""
+
+    row = current_row.copy()
+
+    row["timestamp"] = pd.to_datetime(
+        row["timestamp"],
+        utc=True,
+    )
+
+    # One deterministic ID per UTC hour.
+    row["id"] = (
+        row["timestamp"]
+        .map(lambda x: int(x.timestamp() // 3600))
+        .astype("int64")
+    )
+
+    row = row[
+        [
+            "id",
+            "timestamp",
+            "aqi",
+            "pm25",
+            "pm10",
+            "no2",
+            "o3",
+        ]
+    ].copy()
+
+    row["aqi"] = row["aqi"].astype("int64")
+
+    fg = get_or_create_raw_feature_group(fs)
+
+    log(
+        f"Writing raw observation to "
+        f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}..."
+    )
+
+    fg.insert(
+        row,
+        write_options={
+            "wait_for_job": False
+        }
+    )
+
+    log("Raw observation persisted successfully.")
+
+
+def read_raw_history_from_hopsworks(fs) -> pd.DataFrame:
+    log(
+        f"Reading raw history from Hopsworks "
         f"({RAW_FEATURE_GROUP_NAME}, v{RAW_FEATURE_GROUP_VERSION})..."
     )
 
-    fg = fs.get_feature_group(
-        name=RAW_FEATURE_GROUP_NAME,
-        version=RAW_FEATURE_GROUP_VERSION,
-    )
-
-    end_time = pd.Timestamp.now(tz="UTC")
-
-    # 72 hours is enough for the 24-hour lags plus rolling windows.
-    start_time = (
-        end_time
-        - pd.Timedelta(hours=72)
-    )
+    fg = get_or_create_raw_feature_group(fs)
 
     df = fg.read(
-        start_time=start_time,
-        end_time=end_time,
         read_options={
             "arrow_flight_config": {
                 "timeout": HOPSWORKS_READ_TIMEOUT
             }
-        },
+        }
     )
 
     if df is None or df.empty:
@@ -561,24 +643,30 @@ def get_or_create_serving_feature_group(fs):
     """
 
     try:
-        return fs.get_feature_group(
+        fg = fs.get_feature_group(
             name="aqi_serving_features",
             version=1,
         )
+
+        if fg is not None:
+            return fg
+
     except Exception:
-        return fs.create_feature_group(
-            name="aqi_serving_features",
-            version=1,
-            description=(
-                "Karachi AQI serving features: the exact 98 feature schema "
-                "used by the production Gradient Boosting model, without a "
-                "future target."
-            ),
-            primary_key=["id"],
-            event_time="timestamp",
-            online_enabled=False,
-            time_travel_format="HUDI",
-        )
+        pass
+
+    return fs.create_feature_group(
+        name="aqi_serving_features",
+        version=1,
+        description=(
+            "Karachi AQI serving features: the exact 98 feature schema "
+            "used by the production Random Forest model, without a "
+            "future target."
+        ),
+        primary_key=["id"],
+        event_time="timestamp",
+        online_enabled=True,
+        time_travel_format="DELTA",
+    )
 
 
 def write_serving_feature_row(
@@ -660,7 +748,7 @@ def write_serving_feature_row(
 
     fg.insert(
         output,
-        wait=True,
+        storage="online",
     )
 
     log(
@@ -706,9 +794,15 @@ def check_contiguous_history(
 
     actual = pd.DatetimeIndex(
         required["timestamp"]
+    ).sort_values()
+
+    expected = pd.DatetimeIndex(
+        expected
     )
 
-    if not actual.equals(expected):
+    if len(actual) != len(expected) or not (
+        actual.to_numpy() == expected.to_numpy()
+    ).all():
         return (
             False,
             "The preceding 24 hours are not contiguous. "
@@ -1168,6 +1262,10 @@ def run_pipeline() -> int:
     # We do NOT insert a current observation into it because its future
     # target_aqi is not known yet.
 
+    history_before_current = clean_raw_history(
+        history_before_current
+    )
+
     combined_history = merge_histories(
         history_before_current,
         current_row,
@@ -1177,13 +1275,20 @@ def run_pipeline() -> int:
         combined_history
     )
 
+    # Persist the current raw observation so the next hourly run
+    # can reuse it from Hopsworks.
+    write_raw_observation_to_hopsworks(
+        fs,
+        current_row,
+    )
+
     # ----------------------------------------
     # 5. Check whether 98 features are possible
     # ----------------------------------------
 
     contiguous, reason = (
         check_contiguous_history(
-            combined_history,
+            history_before_current,
             current_timestamp,
         )
     )

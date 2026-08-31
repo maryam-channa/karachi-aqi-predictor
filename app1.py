@@ -1,4 +1,4 @@
-﻿import os
+import os
 import shutil
 import joblib
 import requests
@@ -47,7 +47,7 @@ FEATURE_GROUP_NAME = "aqi_features"
 FEATURE_GROUP_VERSION = 4
 
 MODEL_NAME = "karachi_aqi_random_forest"
-MODEL_VERSION = 4
+MODEL_VERSION = 7
 
 MODEL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -279,7 +279,7 @@ st.markdown(
 # ============================================================
 
 @st.cache_resource
-def load_model_from_hopsworks():
+def load_local_random_forest_model():
 
     try:
 
@@ -343,7 +343,7 @@ def load_model_from_hopsworks():
             return None
 
         st.success(
-            "Random Forest model loaded successfully — 98 features."
+            "Random Forest model loaded successfully ✅ 98 features."
         )
 
         return loaded_model
@@ -835,7 +835,7 @@ def fetch_historical_feature_data():
         # ----------------------------------------------------
 
         st.success(
-            f"Historical AQI cache loaded successfully — "
+            f"Historical AQI cache loaded successfully ✅ "
             f"{len(df)} rows."
         )
 
@@ -1712,13 +1712,13 @@ def render_metric_tile(label, value):
 
 def render_pollutant_card(name, value):
     number = _safe_float(value)
-    text = "—" if number is None else f"{number:.2f}"
+    text = "?" if number is None else f"{number:.2f}"
     st.markdown(
         f"""
         <div class="pollutant-card">
             <div class="pollutant-name">{name}</div>
             <div class="pollutant-value">{text}</div>
-            <div class="pollutant-unit">µg/m³</div>
+            <div class="pollutant-unit">μg/m³</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1795,14 +1795,14 @@ def main():
             <div class="hero-subtitle">
                 Machine-learning powered AQI forecasting for Karachi, Pakistan
             </div>
-            <div clas🤖 ML SYSTEM OPERATIONAL</div>
+            <div class="hero-status">🤖 ML SYSTEM OPERATIONAL</div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
     with st.spinner("Preparing the latest Karachi air-quality forecast..."):
-        model = load_model_from_hopsworks()
+        model = load_local_random_forest_model()
         current_weather = fetch_current_weather()
         forecast_data = fetch_aqi_forecast()
         historical_data = fetch_historical_feature_data()
@@ -1865,7 +1865,7 @@ def main():
     left, right = st.columns([0.9, 1.35], gap="large")
 
     with left:
-        aqi_value = f"{current_aqi:.0f}" if current_aqi is not None else "—"
+        aqi_value = f"{current_aqi:.0f}" if current_aqi is not None else "?"
         st.markdown(
             f"""
             <div class="aqi-card">
@@ -1901,15 +1901,15 @@ def main():
             with weather_cols[0]:
                 render_metric_tile(
                     "Temperature",
-                    f"{float(temp):.1f}°C" if _safe_float(temp) is not None else "—"
+                    f"{float(temp):.1f}°C" if _safe_float(temp) is not None else "?"
                 )
             with weather_cols[1]:
                 render_metric_tile(
                     "Feels Like",
-                    f"{float(feels_like):.1f}°C" if _safe_float(feels_like) is not None else "—"
+                    f"{float(feels_like):.1f}°C" if _safe_float(feels_like) is not None else "?"
                 )
             with weather_cols[2]:
-                render_metric_tile("Humidity", f"{humidity}%" if humidity is not None else "—")
+                render_metric_tile("Humidity", f"{humidity}%" if humidity is not None else "?")
             with weather_cols[3]:
                 render_metric_tile("Conditions", description)
         else:
@@ -2063,9 +2063,9 @@ def main():
     with pollutant_cols[1]:
         render_pollutant_card("PM10", current_pm10)
     with pollutant_cols[2]:
-        render_pollutant_card("NO₂", current_no2)
+        render_pollutant_card("NO2", current_no2)
     with pollutant_cols[3]:
-        render_pollutant_card("O₃", current_o3)
+        render_pollutant_card("O3", current_o3)
 
     pollutant_chart = create_pollutant_chart(pd.DataFrame([{"pm25": current_pm25, "pm10": current_pm10, "no2": current_no2, "o3": current_o3}]))
     if pollutant_chart is not None:
@@ -2111,9 +2111,9 @@ def main():
     model_items = [
         ("MODEL", "Random Forest", "RandomForestRegressor"),
         ("FEATURES", "98", "Verified feature schema"),
-        ("FEATURE GROUP", "v4", "aqi_features"),
-        ("MODEL VERSION", "v4", "Hopsworks Registry"),
-        ("DEPLOYMENT", "READY", "karachiaqirfv4"),
+        ("TRAINING GROUP", "v4", "aqi_features"),
+        ("SERVING GROUP", "v1", "aqi_serving_features"),
+        ("MODEL REGISTRY", "v7", "karachi_aqi_random_forest"),
     ]
 
     for col, (label, value, detail) in zip(model_cols, model_items):
@@ -2147,14 +2147,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
 
