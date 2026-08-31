@@ -1,4 +1,4 @@
-import os
+﻿import os
 import shutil
 import joblib
 import requests
@@ -79,31 +79,17 @@ except Exception:
 
 
 # ============================================================
-# AQI CATEGORIES
+# AQI CATEGORIES — 0–500 SCALE
 # ============================================================
 
-AQI_CATEGORIES = {
-    1: {
-        "name": "Good",
-        "color": "#00e400"
-    },
-    2: {
-        "name": "Fair",
-        "color": "#ffff00"
-    },
-    3: {
-        "name": "Moderate",
-        "color": "#ff7e00"
-    },
-    4: {
-        "name": "Poor",
-        "color": "#ff0000"
-    },
-    5: {
-        "name": "Very Poor",
-        "color": "#99004c"
-    }
-}
+AQI_CATEGORY_RANGES = [
+    (0, 50, "Good", "#00e400"),
+    (51, 100, "Moderate", "#ffff00"),
+    (101, 150, "Unhealthy for Sensitive Groups", "#ff7e00"),
+    (151, 200, "Unhealthy", "#ff0000"),
+    (201, 300, "Very Unhealthy", "#8f3f97"),
+    (301, 500, "Hazardous", "#7e0023"),
+]
 
 
 # ============================================================
@@ -355,6 +341,118 @@ def load_local_random_forest_model():
         )
 
         return None
+
+@st.cache_resource
+def load_recursive_72h_model():
+    """Load the verified 163-feature recursive Random Forest artifacts."""
+
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(
+            base_dir,
+            "models",
+            "recursive_72h",
+            "recursive_random_forest_compressed.pkl",
+        )
+        imputer_path = os.path.join(
+            base_dir,
+            "models",
+            "recursive_72h",
+            "imputer.pkl",
+        )
+        metadata_path = os.path.join(
+            base_dir,
+            "models",
+            "recursive_72h",
+            "metadata.pkl",
+        )
+
+        if not all(os.path.exists(p) for p in [model_path, imputer_path, metadata_path]):
+            missing = [p for p in [model_path, imputer_path, metadata_path] if not os.path.exists(p)]
+            st.error("Missing recursive model artifact(s): " + ", ".join(missing))
+            return None, None, None
+
+        model = joblib.load(model_path)
+        imputer = joblib.load(imputer_path)
+        metadata = joblib.load(metadata_path)
+        feature_columns = list(metadata.get("feature_columns", []))
+
+        model_feature_count = getattr(model, "n_features_in_", None)
+        if int(model_feature_count or -1) != 163 or len(feature_columns) != 163:
+            st.error(
+                f"Recursive model schema mismatch: model={model_feature_count}, metadata={len(feature_columns)}; expected 163."
+            )
+            return None, None, None
+
+        return model, imputer, feature_columns
+
+    except Exception as exc:
+        st.error(f"Error loading recursive 72-hour model: {exc}")
+        return None, None, None
+
+
+RECURSIVE_LAGS = [1, 2, 3, 6, 12, 24]
+RECURSIVE_WINDOWS = [3, 6, 12, 24]
+RECURSIVE_VARIABLES = [
+    "aqi",
+    "pm25",
+    "pm10",
+    "no2",
+    "o3",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "cloud_cover",
+]
+
+
+def build_recursive_163_features(history, timestamp):
+    """Reproduce the exact 163-feature schema used by recursive_72h.py."""
+
+    row = {}
+    timestamp = pd.Timestamp(timestamp).tz_convert("UTC")
+
+    hour = timestamp.hour
+    dow = timestamp.dayofweek
+    month = timestamp.month
+    doy = timestamp.dayofyear
+
+    row["hour"] = hour
+    row["day_of_week"] = dow
+    row["month"] = month
+    row["day_of_year"] = doy
+    row["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    row["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    row["dow_sin"] = np.sin(2 * np.pi * dow / 7)
+    row["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+    row["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    row["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+
+    if len(history) < 25:
+        raise ValueError("At least 25 hours of history are required.")
+
+    current = history.iloc[-1]
+
+    for variable in RECURSIVE_VARIABLES:
+        row[variable] = float(current[variable])
+        for lag in RECURSIVE_LAGS:
+            row[f"{variable}_lag_{lag}h"] = float(history[variable].iloc[-lag])
+
+    for variable in RECURSIVE_VARIABLES:
+        for window in RECURSIVE_WINDOWS:
+            values = history[variable].tail(window).to_numpy(dtype=float)
+            row[f"{variable}_mean_{window}h"] = float(values.mean())
+            row[f"{variable}_std_{window}h"] = float(
+                values.std(ddof=1) if len(values) > 1 else 0.0
+            )
+
+    for window in [6, 12, 24]:
+        values = history["aqi"].tail(window).to_numpy(dtype=float)
+        x = np.arange(len(values), dtype=float)
+        row[f"aqi_slope_{window}h"] = float(np.polyfit(x, values, 1)[0])
+
+    return pd.DataFrame([row])
 
 
 # ============================================================
@@ -700,21 +798,13 @@ def select_three_daily_records(data):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_historical_feature_data():
+    """Load the verified 2-year 0–500 AQI + weather dataset."""
 
-    # ========================================================
-    # LOCAL HISTORICAL CACHE
-    # ========================================================
-    #
-    # The 7-day Hopsworks query was successfully tested from
-    # PowerShell and produced 144 rows. The Streamlit app uses this verified local cache and
-    # does not query the Hopsworks Arrow Flight service at runtime.
-    #
-    # The verified result is stored in:
-    #     data/historical_aqi.csv
-    #
-    # Normal Streamlit startup therefore uses this local cache
-    # and does not make an Arrow Flight request.
-    # ========================================================
+    data_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data",
+        "karachi_aqi_weather_2years.csv",
+    )
 
     required = [
         "timestamp",
@@ -722,137 +812,47 @@ def fetch_historical_feature_data():
         "pm25",
         "pm10",
         "no2",
-        "o3"
+        "o3",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "surface_pressure",
+        "wind_speed_10m",
+        "cloud_cover",
     ]
 
-    data_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "data",
-        "historical_aqi.csv"
-    )
-
-    st.info(
-        "Loading historical AQI data from local cache..."
-    )
-
     try:
-
         if not os.path.exists(data_path):
-
-            st.error(
-                "Historical AQI cache not found: "
-                + data_path
-            )
-
-            st.info(
-                "Run the verified Hopsworks 7-day download "
-                "command to create data/historical_aqi.csv."
-            )
-
+            st.error(f"2-year combined dataset not found: {data_path}")
             return None
 
-        df = pd.read_csv(
-            data_path
-        )
-
-        # ----------------------------------------------------
-        # REQUIRED COLUMN CHECK
-        # ----------------------------------------------------
-
-        missing = [
-            column
-            for column in required
-            if column not in df.columns
-        ]
-
+        df = pd.read_csv(data_path)
+        missing = [c for c in required if c not in df.columns]
         if missing:
-
-            st.error(
-                "Historical AQI cache is missing columns: "
-                + ", ".join(missing)
-            )
-
+            st.error("Combined dataset is missing columns: " + ", ".join(missing))
             return None
-
-        # ----------------------------------------------------
-        # KEEP ONLY RAW FEATURES USED BY THE FEATURE BUILDER
-        # ----------------------------------------------------
 
         df = df[required].copy()
-
-        # ----------------------------------------------------
-        # NORMALIZE TIMESTAMP
-        # ----------------------------------------------------
-
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            utc=True,
-            errors="coerce"
-        )
-
-        # ----------------------------------------------------
-        # NORMALIZE NUMERIC COLUMNS
-        # ----------------------------------------------------
-
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         for column in required[1:]:
-
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce"
-            )
-
-        # ----------------------------------------------------
-        # CLEAN AND SORT
-        # ----------------------------------------------------
+            df[column] = pd.to_numeric(df[column], errors="coerce")
 
         df = (
-            df
-            .dropna(subset=required)
-            .drop_duplicates(
-                subset=["timestamp"],
-                keep="last"
-            )
+            df.dropna(subset=required)
+            .drop_duplicates(subset=["timestamp"], keep="last")
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
 
-        # ----------------------------------------------------
-        # MINIMUM HISTORY CHECK
-        # ----------------------------------------------------
-
         if len(df) < 25:
-
-            st.error(
-                f"Only {len(df)} valid historical rows are "
-                "available. At least 25 are required to build "
-                "the model feature row."
-            )
-
+            st.error(f"Only {len(df)} valid historical rows are available; at least 25 are required.")
             return None
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        st.success(
-            f"Historical AQI cache loaded successfully ✅ "
-            f"{len(df)} rows."
-        )
-
-        st.caption(
-            f"Historical range: {df['timestamp'].min()} → "
-            f"{df['timestamp'].max()}"
-        )
 
         return df
 
-    except Exception as e:
-
-        st.error(
-            f"Could not read local historical AQI cache: {e}"
-        )
-
+    except Exception as exc:
+        st.error(f"Could not load 2-year AQI/weather dataset: {exc}")
         return None
+
 
 # ============================================================
 # MODEL FEATURE INFERENCE ROW
@@ -1106,520 +1106,247 @@ def build_98_feature_row(
 
 
 # ============================================================
-# BUILD 3-DAY FORECAST USING THE MODEL FEATURE SCHEMA
+# BUILD 72-HOUR RECURSIVE FORECAST USING THE 163-FEATURE MODEL
 # ============================================================
 
-def process_forecast_data(
-    data,
+def process_recursive_72h_forecast(
+    forecast_data,
     historical_data,
+    current_weather,
     model,
-    feature_columns
+    imputer,
+    feature_columns,
 ):
+    """Generate 72 recursive hourly predictions and aggregate them into 3 days."""
 
-    if not data or historical_data is None:
-        return None, None, None
-
-    forecast_list = data.get("list", [])
-
-    if not forecast_list:
-        return None, None, None
-
-    # OpenWeather provides hourly pollution forecasts.
-    future_records = []
-
-    for entry in forecast_list:
-        if not entry.get("dt"):
-            continue
-
-        future_records.append(entry)
-
-    future_records = sorted(
-        future_records,
-        key=lambda x: x["dt"]
-    )
-
-    if not future_records:
-        return None, None, None
-
-    # --------------------------------------------------------
-    # Start from the latest observed Hopsworks row.
-    # --------------------------------------------------------
+    if historical_data is None or model is None or imputer is None:
+        return None
 
     history = historical_data.copy()
-
-    history["timestamp"] = pd.to_datetime(
-        history["timestamp"],
-        utc=True
-    )
-
+    history["timestamp"] = pd.to_datetime(history["timestamp"], utc=True)
     history = (
-        history
-        .drop_duplicates(
-            subset=["timestamp"],
-            keep="last"
-        )
+        history.drop_duplicates("timestamp", keep="last")
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
 
-    last_observed = history.iloc[-1].copy()
+    # Start from the most recent local 0–500 AQI observation.
+    latest = history.iloc[-1].copy()
+    latest_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
 
-    # Only use future API rows after the latest observation.
-    future_records = [
-        entry
-        for entry in future_records
-        if pd.to_datetime(
-            datetime.fromtimestamp(
-                entry["dt"],
-                tz=timezone.utc
-            ),
-            utc=True
-        ) > last_observed["timestamp"]
-    ]
+    # Use current OpenWeather pollutants when available, while keeping
+    # the 0–500 AQI from the historical dataset as the recursive starting value.
+    if forecast_data and forecast_data.get("list"):
+        first_api = sorted(forecast_data["list"], key=lambda x: x.get("dt", 0))[0]
+        components = first_api.get("components", {})
+    else:
+        components = {}
 
-    if not future_records:
-        return None, None, None
+    latest_aqi_500 = float(latest["aqi"])
 
-    predictions_by_timestamp = {}
-    feature_rows = []
-    pollutant_rows = []
-
-    previous_aqi = float(last_observed["aqi"])
-
-    # --------------------------------------------------------
-    # Recursive hourly forecasting.
-    #
-    # First row: latest observed hour -> predicts next hour.
-    # Each later row uses the previous predicted AQI as the
-    # current AQI, exactly as required by the AQI lag features.
-    # --------------------------------------------------------
-
-    current_timestamp = last_observed["timestamp"]
-
-    # The first prediction should be for the first future hour.
-    first_entry = future_records[0]
-    first_ts = pd.to_datetime(
-        datetime.fromtimestamp(
-            first_entry["dt"],
-            tz=timezone.utc
+    current_values = {
+        "timestamp": latest_timestamp,
+        "aqi": latest_aqi_500,
+        "pm25": float(components.get("pm2_5", latest["pm25"])),
+        "pm10": float(components.get("pm10", latest["pm10"])),
+        "no2": float(components.get("no2", latest["no2"])),
+        "o3": float(components.get("o3", latest["o3"])),
+        "temperature_2m": float(
+            current_weather.get("main", {}).get("temp", latest["temperature_2m"])
+            if current_weather else latest["temperature_2m"]
         ),
-        utc=True
-    )
-
-    if first_ts > current_timestamp + pd.Timedelta(hours=1):
-        # We cannot safely bridge a missing hourly observation.
-        st.warning(
-            "OpenWeather forecast does not begin immediately after "
-            "the latest Hopsworks observation. Using the first "
-            "available forecast hour."
-        )
-
-    # Predict the first available future hour from the latest
-    # observed row.
-    first_components = first_entry.get("components", {})
-
-    first_features = build_98_feature_row(
-        history,
-        current_timestamp,
-        last_observed["pm25"],
-        last_observed["pm10"],
-        last_observed["no2"],
-        last_observed["o3"],
-        last_observed["aqi"],
-        feature_columns
-    )
-
-    first_prediction = float(
-        np.clip(
-            model.predict(first_features.to_numpy())[0],
-            1,
-            5
-        )
-    )
-
-    predictions_by_timestamp[first_ts] = first_prediction
-
-    # Append first future observation with predicted AQI.
-    first_future_row = {
-        "timestamp": first_ts,
-        "aqi": first_prediction,
-        "pm25": first_components.get("pm2_5", np.nan),
-        "pm10": first_components.get("pm10", np.nan),
-        "no2": first_components.get("no2", np.nan),
-        "o3": first_components.get("o3", np.nan)
+        "relative_humidity_2m": float(
+            current_weather.get("main", {}).get("humidity", latest["relative_humidity_2m"])
+            if current_weather else latest["relative_humidity_2m"]
+        ),
+        "surface_pressure": float(
+            current_weather.get("main", {}).get("pressure", latest["surface_pressure"])
+            if current_weather else latest["surface_pressure"]
+        ),
+        "wind_speed_10m": float(
+            current_weather.get("wind", {}).get("speed", latest["wind_speed_10m"])
+            if current_weather else latest["wind_speed_10m"]
+        ) * 3.6,
+        "cloud_cover": float(
+            current_weather.get("clouds", {}).get("all", latest["cloud_cover"])
+            if current_weather else latest["cloud_cover"]
+        ),
     }
 
-    feature_rows.append(
-        first_features.assign(
-            forecast_timestamp=first_ts,
-            predicted_aqi=first_prediction
-        )
-    )
+    # Replace the same timestamp with the freshest current inputs.
+    history = history[history["timestamp"] != latest_timestamp].copy()
+    history = pd.concat([history, pd.DataFrame([current_values])], ignore_index=True)
+    history = history.sort_values("timestamp").reset_index(drop=True)
 
-    pollutant_rows.append(first_future_row)
+    # Normalize OpenWeather forecast timestamps and keep the first 72 future hours.
+    api_forecasts = {}
+    for entry in (forecast_data or {}).get("list", []):
+        if not entry.get("dt"):
+            continue
+        ts = pd.to_datetime(entry["dt"], unit="s", utc=True).floor("h")
+        if ts > latest_timestamp:
+            api_forecasts[ts] = entry
 
-    recursive_history = pd.concat(
-        [
+    predictions = []
+    feature_rows = []
+    hourly_map = {}
+
+    previous_aqi = float(history["aqi"].iloc[-1])
+
+    # This mirrors the validated recursive experiment: future weather is
+    # held at the latest available weather input unless a separate weather
+    # forecast source is supplied.
+    held_weather = {
+        "temperature_2m": float(history["temperature_2m"].iloc[-1]),
+        "relative_humidity_2m": float(history["relative_humidity_2m"].iloc[-1]),
+        "surface_pressure": float(history["surface_pressure"].iloc[-1]),
+        "wind_speed_10m": float(history["wind_speed_10m"].iloc[-1]),
+        "cloud_cover": float(history["cloud_cover"].iloc[-1]),
+    }
+
+    for step in range(72):
+        target_ts = pd.Timestamp(history["timestamp"].iloc[-1]).tz_convert("UTC") + pd.Timedelta(hours=1)
+        api_item = api_forecasts.get(target_ts)
+        components = api_item.get("components", {}) if api_item else {}
+
+        future_row = {
+            "timestamp": target_ts,
+            "aqi": previous_aqi,
+            "pm25": float(components.get("pm2_5", history["pm25"].iloc[-1])),
+            "pm10": float(components.get("pm10", history["pm10"].iloc[-1])),
+            "no2": float(components.get("no2", history["no2"].iloc[-1])),
+            "o3": float(components.get("o3", history["o3"].iloc[-1])),
+            **held_weather,
+        }
+
+        # First build features from the history available immediately before
+        # the next target step, exactly as in the validated recursive model.
+        X = build_recursive_163_features(
             history,
-            pd.DataFrame([first_future_row])
-        ],
-        ignore_index=True
-    )
-
-    recursive_history = (
-        recursive_history
-        .drop_duplicates(
-            subset=["timestamp"],
-            keep="last"
+            target_ts,
         )
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-
-    previous_aqi = first_prediction
-
-    # --------------------------------------------------------
-    # Remaining hourly predictions.
-    # --------------------------------------------------------
-
-    for entry in future_records[1:]:
-
-        timestamp = pd.to_datetime(
-            datetime.fromtimestamp(
-                entry["dt"],
-                tz=timezone.utc
-            ),
-            utc=True
-        )
-
-        components = entry.get(
-            "components",
-            {}
-        )
-
-        pm25 = components.get("pm2_5", np.nan)
-        pm10 = components.get("pm10", np.nan)
-        no2 = components.get("no2", np.nan)
-        o3 = components.get("o3", np.nan)
-
-        # Use the forecast AQI from the previous hour as the
-        # current AQI for the next recursive step.
-        current_aqi = previous_aqi
-
-        current_features = build_98_feature_row(
-            recursive_history,
-            timestamp,
-            pm25,
-            pm10,
-            no2,
-            o3,
-            current_aqi,
-            feature_columns
-        )
+        X = X[feature_columns].replace([np.inf, -np.inf], np.nan)
+        X_i = imputer.transform(X)
 
         prediction = float(
             np.clip(
-                model.predict(current_features.to_numpy())[0],
-                1,
-                5
+                model.predict(X_i)[0],
+                0,
+                500,
             )
         )
 
-        predictions_by_timestamp[timestamp] = prediction
+        hourly_map[target_ts] = prediction
+        predictions.append(prediction)
+        feature_rows.append(X)
 
-        future_row = {
-            "timestamp": timestamp,
-            "aqi": prediction,
-            "pm25": pm25,
-            "pm10": pm10,
-            "no2": no2,
-            "o3": o3
-        }
-
-        feature_rows.append(
-            current_features.assign(
-                forecast_timestamp=timestamp,
-                predicted_aqi=prediction
-            )
+        future_row["aqi"] = prediction
+        history = pd.concat(
+            [history, pd.DataFrame([future_row])],
+            ignore_index=True,
         )
-
-        pollutant_rows.append(future_row)
-
-        recursive_history = pd.concat(
-            [
-                recursive_history,
-                pd.DataFrame([future_row])
-            ],
-            ignore_index=True
-        )
-
-        recursive_history = (
-            recursive_history
-            .drop_duplicates(
-                subset=["timestamp"],
-                keep="last"
-            )
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
-
         previous_aqi = prediction
 
-    # --------------------------------------------------------
-    # Select exactly one prediction per day, matching the
-    # existing dashboard's 3-day layout.
-    # --------------------------------------------------------
+    hourly_predictions = np.asarray(predictions, dtype=float)
 
-    daily_predictions = {}
-    daily_pollutants = {}
+    day_predictions = []
+    day_dates = []
+    day_min = []
+    day_max = []
 
-    for timestamp, prediction in predictions_by_timestamp.items():
+    first_ts = min(hourly_map.keys())
 
-        date_key = timestamp.date()
-
-        if date_key not in daily_predictions:
-            daily_predictions[date_key] = prediction
-
-        if date_key not in daily_pollutants:
-            daily_pollutants[date_key] = {
-                "timestamp": timestamp,
-                "aqi": prediction,
-                "pm25": np.nan,
-                "pm10": np.nan,
-                "no2": np.nan,
-                "o3": np.nan
-            }
-
-    if len(daily_predictions) < 3:
-        return None, None, None
-
-    selected_dates = sorted(
-        daily_predictions.keys()
-    )[:3]
-
-    predictions = np.array(
-        [
-            daily_predictions[d]
-            for d in selected_dates
-        ],
-        dtype=float
-    )
-
-    forecast_dates = [
-        d.strftime("%Y-%m-%d")
-        for d in selected_dates
-    ]
-
-    # Pollutant chart uses the first forecast observation of the
-    # corresponding day.
-    pollutant_df = pd.DataFrame(
-        [
-            next(
-                row for row in pollutant_rows
-                if row["timestamp"].date() == d
-            )
-            for d in selected_dates
+    for day_index in range(3):
+        start = first_ts + pd.Timedelta(hours=24 * day_index)
+        end = start + pd.Timedelta(hours=24)
+        values = [
+            v for ts, v in hourly_map.items()
+            if start <= ts < end
         ]
-    )
+        if len(values) != 24:
+            return None
+        day_predictions.append(float(np.mean(values)))
+        day_dates.append(start.strftime("%Y-%m-%d"))
+        day_min.append(float(np.min(values)))
+        day_max.append(float(np.max(values)))
 
-    # Preserve the model-feature rows for diagnostics.
-    feature_df = pd.concat(
-        feature_rows,
-        ignore_index=True
-    )
+    feature_df = pd.concat(feature_rows, ignore_index=True)
 
-    pollutant_df.attrs["shap_features"] = (
-    feature_df[feature_columns].iloc[[0]].copy()
-    )
+    # First recursive feature row is used for SHAP explanation.
+    shap_features = feature_df.iloc[[0]].copy()
 
-    feature_df.attrs["hourly_predictions"] = predictions_by_timestamp
-    feature_df.attrs["selected_dates"] = forecast_dates
-    feature_df.attrs["daily_predictions"] = predictions
-
-    return (
-        pollutant_df,
-        predictions,
-        forecast_dates
-    )
+    return {
+        "hourly_predictions": hourly_map,
+        "daily_predictions": np.asarray(day_predictions, dtype=float),
+        "forecast_dates": day_dates,
+        "daily_min": day_min,
+        "daily_max": day_max,
+        "shap_features": shap_features,
+        "first_forecast_timestamp": first_ts,
+    }
 
 
 # ============================================================
-# PREDICT AQI
+# MODEL VALIDATION / AQI HELPERS
+# ============================================================
 
-def predict_aqi(
-    model,
-    input_data
-):
-
+def get_aqi_category(aqi):
     try:
+        value = float(aqi)
+    except (TypeError, ValueError):
+        return "Unknown"
 
-        if input_data is None:
-            return None
+    if value < 0:
+        return "Unknown"
 
-        model_feature_count = getattr(
-            model,
-            "n_features_in_",
-            None
-        )
+    for low, high, name, _ in AQI_CATEGORY_RANGES:
+        if low <= value <= high:
+            return name
 
-        if model_feature_count is None:
-            st.error(
-                "Loaded model does not expose n_features_in_."
-            )
-            return None
-
-        if int(model_feature_count) != 98:
-            st.error(
-                f"Expected model to use 98 features, but it uses {model_feature_count}."
-            )
-            return None
-
-        required_features = list(FEATURE_COLUMNS)
-
-        missing_features = [
-            feature
-            for feature in required_features
-            if feature not in input_data.columns
-        ]
-
-        if missing_features:
-            st.error(
-                "Missing model features: "
-                + str(missing_features)
-            )
-            return None
-
-        model_input = input_data[
-            required_features
-        ].copy()
-
-        predictions = model.predict(
-            model_input.to_numpy()
-        )
-
-        return np.clip(
-            predictions,
-            1,
-            5
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Prediction error: {e}"
-        )
-
-        return None
-
-# ============================================================
-# AQI CATEGORY
-# ============================================================
-
-def get_aqi_category(
-    aqi
-):
-
-    value = int(
-        round(
-            float(aqi)
-        )
-    )
-
-    return AQI_CATEGORIES.get(
-        value,
-        {
-            "name": "Unknown"
-        }
-    )["name"]
+    return "Hazardous"
 
 
-# ============================================================
-# AQI COLOR
-# ============================================================
+def get_aqi_color(aqi):
+    try:
+        value = float(aqi)
+    except (TypeError, ValueError):
+        return "#94A3B8"
 
-def get_aqi_color(
-    aqi
-):
+    for low, high, _, color in AQI_CATEGORY_RANGES:
+        if low <= value <= high:
+            return color
 
-    value = int(
-        round(
-            float(aqi)
-        )
-    )
-
-    return AQI_CATEGORIES.get(
-        value,
-        {
-            "color": "#808080"
-        }
-    )["color"]
+    return "#7e0023"
 
 
-# ============================================================
-# AQI CHART
-# ============================================================
-
-def create_aqi_chart(
-    predictions,
-    dates
-):
-
-    bar_colors = [
-
-        get_aqi_color(
-            prediction
-        )
-
-        for prediction in predictions
-    ]
+def create_aqi_chart(predictions, dates):
+    values = [float(v) for v in predictions]
 
     fig = go.Figure()
-
     fig.add_trace(
         go.Bar(
-
             x=dates,
-
-            y=predictions,
-
-            marker_color=bar_colors,
-
-            text=[
-                f"{prediction:.2f}"
-                for prediction in predictions
-            ],
-
-            textposition="auto"
+            y=values,
+            marker_color=[get_aqi_color(v) for v in values],
+            text=[f"{v:.2f}" for v in values],
+            textposition="auto",
+            hovertemplate="<b>%{x}</b><br>Predicted AQI: %{y:.2f}<extra></extra>",
         )
     )
 
     fig.update_layout(
-
-        
-
-        xaxis=dict(type="category"),
-
-        yaxis=dict(
-
-            range=[
-                0,
-                5.5
-            ],
-
-            dtick=1
-        ),
-
         plot_bgcolor="rgba(0,0,0,0)",
-
         paper_bgcolor="rgba(0,0,0,0)",
-
-        font=dict(
-            color="#e5e7eb"
-        ),
-
-        height=400
+        font=dict(color="#e5e7eb"),
+        height=400,
+        margin=dict(l=50, r=20, t=20, b=50),
+        yaxis=dict(range=[0, 500], dtick=50, title="AQI (0–500)"),
+        xaxis=dict(type="category", title=None),
+        showlegend=False,
     )
 
+    fig.update_yaxes(gridcolor="rgba(148,163,184,.10)", zeroline=False)
+    fig.update_xaxes(showgrid=False)
     return fig
 
 
@@ -1787,38 +1514,27 @@ def create_shap_explanation(model, feature_row, feature_columns, max_features=12
 
 
 def main():
-
     st.markdown(
         """
         <div class="hero">
             <div class="hero-title">🌎 Karachi Air Quality</div>
             <div class="hero-subtitle">
-                Machine-learning powered AQI forecasting for Karachi, Pakistan
+                Machine-learning powered 72-hour AQI forecasting for Karachi, Pakistan
             </div>
-            <div class="hero-status">🤖 ML SYSTEM OPERATIONAL</div>
+            <div class="hero-status">🤖 72-HOUR ML SYSTEM OPERATIONAL</div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     with st.spinner("Preparing the latest Karachi air-quality forecast..."):
-        model = load_local_random_forest_model()
+        model, imputer, model_features = load_recursive_72h_model()
         current_weather = fetch_current_weather()
         forecast_data = fetch_aqi_forecast()
         historical_data = fetch_historical_feature_data()
 
-    if model is None:
-        st.error("The trained model could not be loaded.")
-        st.stop()
-
-    model_feature_count = getattr(model, "n_features_in_", None)
-    if model_feature_count != 98:
-        st.error(f"Model schema error: expected 98 features, found {model_feature_count}.")
-        st.stop()
-
-    model_features = list(FEATURE_COLUMNS)
-    if len(model_features) != 98:
-        st.error(f"Feature metadata error: expected 98 features, found {len(model_features)}.")
+    if model is None or imputer is None or model_features is None:
+        st.error("The 72-hour recursive model could not be loaded.")
         st.stop()
 
     if forecast_data is None:
@@ -1826,42 +1542,78 @@ def main():
         st.stop()
 
     if historical_data is None:
-        st.error("Historical AQI data is unavailable.")
+        st.error("The 2-year AQI + weather history is unavailable.")
         st.stop()
 
-    processed_data, predictions, forecast_dates = process_forecast_data(
-        forecast_data, historical_data, model, model_features
+    forecast_result = process_recursive_72h_forecast(
+        forecast_data,
+        historical_data,
+        current_weather,
+        model,
+        imputer,
+        model_features,
     )
+
+    if forecast_result is None:
+        st.error("The 72-hour AQI forecast could not be generated.")
+        st.stop()
 
     if forecast_data.get("_fallback", False):
         st.warning(
-            "OpenWeather's forecast endpoint is temporarily unavailable. "
-            "The model is using the latest available pollutant values as fallback inputs."
+            "OpenWeather's forecast endpoint was unavailable. "
+            "The latest pollutant values are being held constant for future hours."
         )
 
-    if processed_data is None or predictions is None or forecast_dates is None:
-        st.error("The 3-day AQI forecast could not be generated.")
-        st.stop()
+    predictions = forecast_result["daily_predictions"]
+    forecast_dates = forecast_result["forecast_dates"]
+    daily_min = forecast_result["daily_min"]
+    daily_max = forecast_result["daily_max"]
+    shap_features = forecast_result["shap_features"]
 
+    # Current observed values come from the latest verified 0–500 dataset row.
     latest = historical_data.iloc[-1]
     current_aqi = _safe_float(latest.get("aqi"))
     current_pm25 = _safe_float(latest.get("pm25"))
     current_pm10 = _safe_float(latest.get("pm10"))
     current_no2 = _safe_float(latest.get("no2"))
     current_o3 = _safe_float(latest.get("o3"))
+    last_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
 
-    current_category = get_aqi_category(current_aqi) if current_aqi is not None else "Unknown"
-    current_color = get_aqi_color(current_aqi) if current_aqi is not None else "#94A3B8"
-    last_timestamp = latest["timestamp"]
+    current_category = get_aqi_category(current_aqi)
+    current_color = get_aqi_color(current_aqi)
 
-    # Hazardous AQI alert
-    if current_aqi is not None and current_aqi >= 5:
+    # Validation metrics are the verified held-out recursive evaluation.
+    metadata_path = os.path.join(
+        MODEL_DIR,
+        "recursive_72h",
+        "metadata.pkl",
+    )
+
+    validation = {}
+    try:
+        validation = joblib.load(metadata_path).get("day_results", {})
+    except Exception:
+        validation = {}
+
+    # Hazardous alerts on the 0–500 scale.
+    if current_aqi is not None and current_aqi >= 301:
         st.error(
-            "🚨 Hazardous AQI Alert: Air quality is Very Poor. "
-            "Consider reducing prolonged outdoor exposure."
+            "🚨 Hazardous AQI Alert: Air quality is hazardous. "
+            "Avoid prolonged outdoor exposure and consider protective measures."
+        )
+    elif current_aqi is not None and current_aqi >= 201:
+        st.warning(
+            "⚠️ Very Unhealthy AQI Alert: Air quality is very unhealthy. "
+            "Sensitive groups should reduce outdoor exposure."
+        )
+    elif current_aqi is not None and current_aqi >= 151:
+        st.warning(
+            "⚠️ Unhealthy AQI Alert: Consider reducing prolonged outdoor exposure."
         )
 
+    # --------------------------------------------------------
     # Current AQI + weather
+    # --------------------------------------------------------
     left, right = st.columns([0.9, 1.35], gap="large")
 
     with left:
@@ -1877,15 +1629,14 @@ def main():
                 </div>
             </div>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
     with right:
         st.markdown(
             '<div class="glass-card">🌎 Karachi — Current Conditions</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-
         weather_cols = st.columns(4)
 
         if current_weather:
@@ -1901,15 +1652,18 @@ def main():
             with weather_cols[0]:
                 render_metric_tile(
                     "Temperature",
-                    f"{float(temp):.1f}°C" if _safe_float(temp) is not None else "?"
+                    f"{float(temp):.1f}°C" if _safe_float(temp) is not None else "?",
                 )
             with weather_cols[1]:
                 render_metric_tile(
                     "Feels Like",
-                    f"{float(feels_like):.1f}°C" if _safe_float(feels_like) is not None else "?"
+                    f"{float(feels_like):.1f}°C" if _safe_float(feels_like) is not None else "?",
                 )
             with weather_cols[2]:
-                render_metric_tile("Humidity", f"{humidity}%" if humidity is not None else "?")
+                render_metric_tile(
+                    "Humidity",
+                    f"{humidity}%" if humidity is not None else "?",
+                )
             with weather_cols[3]:
                 render_metric_tile("Conditions", description)
         else:
@@ -1917,10 +1671,16 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # --------------------------------------------------------
     # 3-day forecast
+    # --------------------------------------------------------
     st.markdown(
         '<div class="glass-card"><div class="section-title">📅 3-Day AQI Forecast</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Each day represents the mean predicted AQI across its 24-hour recursive forecast block."
     )
 
     forecast_cols = st.columns(3, gap="medium")
@@ -1933,128 +1693,124 @@ def main():
             st.markdown(
                 f"""
                 <div class="forecast-card">
-                    <div class="forecast-date">{forecast_dates[i]}</div>
+                    <div class="forecast-date">DAY {i + 1} · {forecast_dates[i]}</div>
                     <div class="forecast-value" style="color:{color};">{value:.2f}</div>
                     <div class="forecast-category" style="color:{color};">{category}</div>
+                    <div style="color:#64748B;font-size:.72rem;margin-top:.45rem;">
+                        Min {daily_min[i]:.1f} · Max {daily_max[i]:.1f}
+                    </div>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
 
     chart = create_aqi_chart(predictions, forecast_dates)
-    chart.update_layout(
-        margin=dict(l=20, r=20, t=20, b=20),
-        showlegend=False,
-        hovermode="x unified"
-    )
-    chart.update_yaxes(gridcolor="rgba(148,163,184,.10)", zeroline=False)
-    chart.update_xaxes(showgrid=False)
-
     st.plotly_chart(
         chart,
         width="stretch",
-        config={"displayModeBar": False, "responsive": True}
+        config={"displayModeBar": False, "responsive": True},
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # SHAP Explainability
+    # --------------------------------------------------------
+    # Validation performance
+    # --------------------------------------------------------
     st.markdown(
-        '<div class="glass-card"><div class="section-title">🔍 Why This Prediction?</div>',
-        unsafe_allow_html=True
+        '<div class="glass-card"><div class="section-title">📈 Model Validation Performance</div>',
+        unsafe_allow_html=True,
     )
 
-    shap_features = processed_data.attrs.get(
-        "shap_features"
+    validation_cols = st.columns(3, gap="medium")
+    for i, key in enumerate(["Day 1", "Day 2", "Day 3"]):
+        metrics = validation.get(key, {})
+        r2 = float(metrics.get("r2", 0.0))
+        with validation_cols[i]:
+            status = "PASS · R² > 0.70" if r2 > 0.70 else "Below target"
+            st.markdown(
+                f"""
+                <div class="forecast-card">
+                    <div class="forecast-date">{key.upper()} VALIDATION R²</div>
+                    <div class="forecast-value">{r2:.4f}</div>
+                    <div class="forecast-category">{status}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.caption(
+        "Validation R² values come from the held-out historical recursive 72-hour evaluation; they are model-validation metrics, not live-future R² values."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --------------------------------------------------------
+    # SHAP
+    # --------------------------------------------------------
+    st.markdown(
+        '<div class="glass-card"><div class="section-title">🔍 Why This Prediction?</div>',
+        unsafe_allow_html=True,
     )
 
     shap_explanation = create_shap_explanation(
         model,
         shap_features,
         model_features,
-        max_features=12
+        max_features=12,
     )
 
     if shap_explanation is not None and not shap_explanation.empty:
-
         st.markdown(
-            """
-            <div style="color:#94A3B8;font-size:.85rem;margin-bottom:.8rem;">
-                SHAP shows how the most influential features contributed
-                to the first forecasted AQI value.
-            </div>
-            """,
-            unsafe_allow_html=True
+            '<div style="color:#94A3B8;font-size:.85rem;margin-bottom:.8rem;">SHAP shows how the most influential features contributed to the first forecasted hourly AQI value.</div>',
+            unsafe_allow_html=True,
         )
 
         shap_chart = go.Figure()
-
         shap_chart.add_trace(
             go.Bar(
                 x=shap_explanation["shap_value"],
                 y=shap_explanation["feature"],
                 orientation="h",
                 hovertemplate=(
-                    "<b>%{y}</b><br>"
-                    "SHAP impact: %{x:.4f}"
-                    "<extra></extra>"
-                )
+                    "<b>%{y}</b><br>SHAP impact: %{x:.4f}<extra></extra>"
+                ),
             )
         )
-
         shap_chart.update_layout(
             height=430,
-            margin=dict(
-                l=20,
-                r=20,
-                t=20,
-                b=20
-            ),
+            margin=dict(l=20, r=20, t=20, b=20),
             xaxis_title="SHAP Value",
             yaxis_title=None,
             showlegend=False,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(
-                color="#CBD5E1"
-            )
+            font=dict(color="#CBD5E1"),
         )
-
         shap_chart.update_xaxes(
             zeroline=True,
             zerolinecolor="rgba(148,163,184,.25)",
-            gridcolor="rgba(148,163,184,.10)"
+            gridcolor="rgba(148,163,184,.10)",
         )
-
         shap_chart.update_yaxes(
             gridcolor="rgba(148,163,184,.06)"
         )
-
         st.plotly_chart(
             shap_chart,
             width="stretch",
-            config={
-                "displayModeBar": False,
-                "responsive": True
-            }
+            config={"displayModeBar": False, "responsive": True},
         )
-
         st.caption(
-            "Positive SHAP values push the prediction higher; "
-            "negative values push it lower."
+            "Positive SHAP values push the prediction higher; negative values push it lower."
         )
-
     else:
-
-        st.info(
-            "SHAP explanation is temporarily unavailable."
-        )
+        st.info("SHAP explanation is temporarily unavailable.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # --------------------------------------------------------
     # Pollutants
+    # --------------------------------------------------------
     st.markdown(
         '<div class="glass-card"><div class="section-title">🧪 Current Pollutant Levels</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     pollutant_cols = st.columns(4, gap="medium")
@@ -2067,53 +1823,84 @@ def main():
     with pollutant_cols[3]:
         render_pollutant_card("O3", current_o3)
 
-    pollutant_chart = create_pollutant_chart(pd.DataFrame([{"pm25": current_pm25, "pm10": current_pm10, "no2": current_no2, "o3": current_o3}]))
+    pollutant_chart = create_pollutant_chart(
+        pd.DataFrame(
+            [{
+                "pm25": current_pm25,
+                "pm10": current_pm10,
+                "no2": current_no2,
+                "o3": current_o3,
+            }]
+        )
+    )
     if pollutant_chart is not None:
         pollutant_chart.update_layout(
-            
             margin=dict(l=20, r=20, t=10, b=20),
-            showlegend=False
+            showlegend=False,
         )
-        pollutant_chart.update_yaxes(gridcolor="rgba(148,163,184,.10)", zeroline=False)
+        pollutant_chart.update_yaxes(
+            gridcolor="rgba(148,163,184,.10)",
+            zeroline=False,
+        )
         pollutant_chart.update_xaxes(showgrid=False)
-
         st.plotly_chart(
             pollutant_chart,
             width="stretch",
-            config={"displayModeBar": False, "responsive": True}
+            config={"displayModeBar": False, "responsive": True},
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # --------------------------------------------------------
     # Forecast table
+    # --------------------------------------------------------
     st.markdown(
         '<div class="glass-card"><div class="section-title">📊 Forecast Details</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-    forecast_table = pd.DataFrame({
-        "Date": forecast_dates,
-        "Predicted AQI": [round(float(v), 2) for v in predictions],
-        "Category": [get_aqi_category(v) for v in predictions]
-    })
+    forecast_table = pd.DataFrame(
+        {
+            "Horizon": [
+                "Day 1 · 0–24h",
+                "Day 2 · 24–48h",
+                "Day 3 · 48–72h",
+            ],
+            "Date": forecast_dates,
+            "Predicted Mean AQI": [round(float(v), 2) for v in predictions],
+            "Minimum AQI": [round(float(v), 2) for v in daily_min],
+            "Maximum AQI": [round(float(v), 2) for v in daily_max],
+            "Category": [get_aqi_category(v) for v in predictions],
+        }
+    )
 
-    st.dataframe(forecast_table, width="stretch", hide_index=True)
+    st.dataframe(
+        forecast_table,
+        width="stretch",
+        hide_index=True,
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # --------------------------------------------------------
     # ML system
+    # --------------------------------------------------------
     st.markdown(
         '<div class="glass-card"><div class="section-title">🤖 Machine Learning System</div>'
         '<div class="model-strip">',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     model_cols = st.columns(5, gap="medium")
     model_items = [
-        ("MODEL", "Random Forest", "RandomForestRegressor"),
-        ("FEATURES", "98", "Verified feature schema"),
-        ("TRAINING GROUP", "v4", "aqi_features"),
-        ("SERVING GROUP", "v1", "aqi_serving_features"),
-        ("MODEL REGISTRY", "v7", "karachi_aqi_random_forest"),
+        ("MODEL", "Random Forest", "Recursive 72-hour forecasting"),
+        ("FEATURES", "163", "Verified training schema"),
+        ("DATA", "2+ Years", "Hourly AQI + weather"),
+        ("FORECAST", "72 Hours", "3 × 24-hour blocks"),
+        (
+            "R² VALIDATION",
+            f"{validation.get('Day 1', {}).get('r2', 0):.3f} / {validation.get('Day 2', {}).get('r2', 0):.3f} / {validation.get('Day 3', {}).get('r2', 0):.3f}",
+            "Day 1 / Day 2 / Day 3",
+        ),
     ]
 
     for col, (label, value, detail) in zip(model_cols, model_items):
@@ -2126,7 +1913,7 @@ def main():
                     <div class="model-detail">{detail}</div>
                 </div>
                 """,
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
 
     st.markdown("</div></div>", unsafe_allow_html=True)
@@ -2134,10 +1921,10 @@ def main():
     st.markdown(
         """
         <div style="text-align:center;padding:1.2rem 0 .5rem;color:#64748B;font-size:.78rem;">
-            Karachi AQI Forecast • OpenWeather • Hopsworks • 98-Feature Random Forest
+            Karachi AQI Forecast • OpenWeather • Open-Meteo historical weather • 2+ year dataset • 163-Feature Recursive Random Forest
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
@@ -2147,4 +1934,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
