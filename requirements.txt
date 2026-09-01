@@ -17,6 +17,7 @@ hopsworks==5.0.6
 deltalake>=1.6.3
 confluent-kafka>=2.0.0
 
+shap==0.51.0
 cloudpickle
 llvmlite
 numba
