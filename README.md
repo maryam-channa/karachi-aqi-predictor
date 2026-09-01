@@ -1,5 +1,18 @@
 # Karachi AQI Predictor
 
+> Machine-learning powered 72-hour AQI forecasting system for Karachi, Pakistan.
+
+## 🔗 Project Links
+
+🌐 **Live Dashboard:**
+https://karachi-aqi-intelligence.streamlit.app/
+
+📄 **Final Project Report:**
+[View Final Project Report (PDF)](report/Karachi_AQI_Predictor_Final_Project_Report.pdf)
+
+💻 **GitHub Repository:**
+https://github.com/maryam-channa/karachi-aqi-predictor
+
 An end-to-end machine learning system for forecasting the Air Quality Index (AQI) of Karachi, Pakistan for the next 72 hours.
 
 ## Project Overview
