@@ -238,6 +238,15 @@ st.markdown(
         font-weight:750;
     }
 
+    .subsection-title {
+        color:#cbd5e1;
+        font-size:.78rem;
+        font-weight:850;
+        letter-spacing:.04em;
+        text-transform:uppercase;
+        margin:1rem 0 .45rem;
+    }
+
     .panel {
         border:1px solid var(--border);
         border-radius:20px;
@@ -2502,6 +2511,66 @@ def main():
             unsafe_allow_html=True,
         )
 
+    # --------------------------------------------------------
+    # VALIDATION COMPARISON TABLE
+    # --------------------------------------------------------
+    validation_table = pd.DataFrame(
+        [
+            {
+                "Forecast Horizon": "Day 1 (0–24h)",
+                "RMSE": float(validation["Day 1"]["rmse"]),
+                "MAE": float(validation["Day 1"]["mae"]),
+                "R²": float(validation["Day 1"]["r2"]),
+            },
+            {
+                "Forecast Horizon": "Day 2 (24–48h)",
+                "RMSE": float(validation["Day 2"]["rmse"]),
+                "MAE": float(validation["Day 2"]["mae"]),
+                "R²": float(validation["Day 2"]["r2"]),
+            },
+            {
+                "Forecast Horizon": "Day 3 (48–72h)",
+                "RMSE": float(validation["Day 3"]["rmse"]),
+                "MAE": float(validation["Day 3"]["mae"]),
+                "R²": float(validation["Day 3"]["r2"]),
+            },
+        ]
+    )
+
+    st.markdown(
+        '<div class="subsection-title">Validation Comparison</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.dataframe(
+        validation_table.style.format(
+            {
+                "RMSE": "{:.4f}",
+                "MAE": "{:.4f}",
+                "R²": "{:.4f}",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Forecast Horizon": st.column_config.TextColumn(
+                "Forecast Horizon",
+            ),
+            "RMSE": st.column_config.NumberColumn(
+                "RMSE",
+                format="%.4f",
+            ),
+            "MAE": st.column_config.NumberColumn(
+                "MAE",
+                format="%.4f",
+            ),
+            "R²": st.column_config.NumberColumn(
+                "R²",
+                format="%.4f",
+            ),
+        },
+    )
+
     st.caption(
         "Day 1 = 0–24h • Day 2 = 24–48h • Day 3 = 48–72h. "
         "These R² values are validation metrics, not live-future R² values."
@@ -2778,22 +2847,7 @@ def main():
             """,
             unsafe_allow_html=True,
         )
-
-        st.markdown(
-            """
-            **Forecast design:** The model predicts the next hourly AQI recursively.
-            The resulting 72 hourly predictions are grouped into three 24-hour blocks.
-
-            **Validation:** The final historical evaluation uses a chronological hold-out
-            and reports separate R², RMSE, and MAE for Day 1, Day 2, and Day 3.
-
-            **Operational note:** Live future pollutant and weather inputs can differ from
-            the controlled historical validation setting, so validation scores should not
-            be interpreted as guaranteed live accuracy.
-            """
-        )
-
-    # --------------------------------------------------------
+# --------------------------------------------------------
     # MODEL SYSTEM STRIP
     # --------------------------------------------------------
     render_section(
