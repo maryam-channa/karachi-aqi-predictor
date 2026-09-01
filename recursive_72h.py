@@ -1,6 +1,8 @@
+import os
 import joblib
 import numpy as np
 import pandas as pd
+import hopsworks
 
 from pathlib import Path
 from sklearn.ensemble import RandomForestRegressor
@@ -18,6 +20,12 @@ WINDOWS = [3, 6, 12, 24]
 
 def make_features(history, timestamp):
     row = {}
+
+    timestamp = pd.Timestamp(timestamp)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
 
     hour = timestamp.hour
     dow = timestamp.dayofweek
@@ -154,14 +162,18 @@ for _, group in df.groupby("segment", sort=False):
         samples.append(X)
 
 
+if not samples:
+    raise RuntimeError(
+        "No training samples could be constructed."
+    )
+
 train_data = pd.concat(
     samples,
     ignore_index=True,
 )
 
 feature_columns = [
-    c
-    for c in train_data.columns
+    c for c in train_data.columns
     if c not in {"timestamp", "target"}
 ]
 
@@ -170,9 +182,7 @@ feature_columns = [
 # CHRONOLOGICAL TRAIN / TEST
 # ============================================================
 
-split = int(
-    len(train_data) * 0.80
-)
+split = int(len(train_data) * 0.80)
 
 train = train_data.iloc[:split].copy()
 test = train_data.iloc[split:].copy()
@@ -212,20 +222,37 @@ one_step_pred = model.predict(
     X_test_i
 )
 
+one_step_rmse = np.sqrt(
+    mean_squared_error(
+        y_test,
+        one_step_pred,
+    )
+)
+
+one_step_mae = mean_absolute_error(
+    y_test,
+    one_step_pred,
+)
+
+one_step_r2 = r2_score(
+    y_test,
+    one_step_pred,
+)
+
 print("=" * 60)
 print("ONE-STEP MODEL")
 print("=" * 60)
 
 print(
-    f"RMSE: {np.sqrt(mean_squared_error(y_test, one_step_pred)):.6f}"
+    f"RMSE: {one_step_rmse:.6f}"
 )
 
 print(
-    f"MAE:  {mean_absolute_error(y_test, one_step_pred):.6f}"
+    f"MAE:  {one_step_mae:.6f}"
 )
 
 print(
-    f"R2:   {r2_score(y_test, one_step_pred):.6f}"
+    f"R2:   {one_step_r2:.6f}"
 )
 
 
@@ -233,7 +260,6 @@ print(
 # RECURSIVE 72-HOUR EVALUATION
 # ============================================================
 
-# Use the final continuous segment of the dataset.
 segments = [
     g.reset_index(drop=True)
     for _, g in df.groupby(
@@ -370,6 +396,11 @@ for name, start, end in [
         "rmse": float(rmse),
         "mae": float(mae),
         "r2": float(r2),
+        "status": (
+            "PASS"
+            if r2 > 0.70
+            else "FAIL"
+        ),
     }
 
     print(
@@ -382,34 +413,329 @@ for name, start, end in [
 
 
 # ============================================================
-# SAVE
+# SAVE FINAL MODEL ARTIFACTS
 # ============================================================
 
+MODEL_ARTIFACT = (
+    OUTPUT_DIR
+    / "recursive_random_forest_compressed.pkl"
+)
+
+IMPUTER_ARTIFACT = (
+    OUTPUT_DIR
+    / "imputer.pkl"
+)
+
+METADATA_ARTIFACT = (
+    OUTPUT_DIR
+    / "metadata.pkl"
+)
+
+# Save compressed model so it remains below GitHub's
+# 100 MB individual-file limit.
 joblib.dump(
     model,
-    OUTPUT_DIR / "recursive_random_forest.pkl",
+    MODEL_ARTIFACT,
+    compress=3,
 )
 
 joblib.dump(
     imputer,
-    OUTPUT_DIR / "imputer.pkl",
+    IMPUTER_ARTIFACT,
 )
 
-joblib.dump(
-    {
-        "feature_columns": feature_columns,
-        "one_step_r2": float(
-            r2_score(
-                y_test,
-                one_step_pred,
-            )
-        ),
-        "day_results": results,
+metadata = {
+    "feature_columns": feature_columns,
+    "feature_count": len(feature_columns),
+
+    "model_type": (
+        "Recursive Random Forest"
+    ),
+
+    "aqi_scale": "0-500",
+
+    "training_data": str(INPUT),
+
+    "training_rows": len(train),
+    "testing_rows": len(test),
+    "train_ratio": 0.80,
+
+    "random_state": 42,
+
+    "one_step_metrics": {
+        "rmse": float(one_step_rmse),
+        "mae": float(one_step_mae),
+        "r2": float(one_step_r2),
     },
-    OUTPUT_DIR / "metadata.pkl",
+
+    "one_step_r2": float(
+        one_step_r2
+    ),
+
+    "day_results": results,
+
+    "forecast_definition": {
+        "day1": "Hours 1-24",
+        "day2": "Hours 25-48",
+        "day3": "Hours 49-72",
+    },
+
+    "validation_method": (
+        "Chronological held-out recursive 72-hour evaluation"
+    ),
+
+    "model_artifact": str(
+        MODEL_ARTIFACT
+    ),
+}
+
+joblib.dump(
+    metadata,
+    METADATA_ARTIFACT,
 )
 
 print(
-    "\nSaved models to:",
-    OUTPUT_DIR.resolve()
+    "\n" + "=" * 60
+)
+
+print(
+    "FINAL MODEL ARTIFACTS SAVED"
+)
+
+print(
+    "=" * 60
+)
+
+print(
+    f"Model:    {MODEL_ARTIFACT}"
+)
+
+print(
+    f"Imputer:  {IMPUTER_ARTIFACT}"
+)
+
+print(
+    f"Metadata: {METADATA_ARTIFACT}"
+)
+
+
+# ============================================================
+# HOPSWORKS MODEL REGISTRY
+# ============================================================
+
+def register_recursive_model():
+    """
+    Register the final recursive 72-hour Random Forest
+    in the Hopsworks Model Registry.
+
+    A new model version is created automatically by Hopsworks.
+    """
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "REGISTERING FINAL RECURSIVE MODEL"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    host = os.getenv(
+        "HOPSWORKS_HOST",
+        "eu-west.cloud.hopsworks.ai",
+    )
+
+    project_name = os.getenv(
+        "HOPSWORKS_PROJECT",
+        "noismore",
+    )
+
+    api_key = os.getenv(
+        "HOPSWORKS_API_KEY"
+    )
+
+    if not api_key:
+        print(
+            "HOPSWORKS_API_KEY is not set."
+        )
+        print(
+            "Local training completed, but "
+            "Model Registry registration was skipped."
+        )
+        return None
+
+    try:
+        print(
+            "Connecting to Hopsworks..."
+        )
+
+        project = hopsworks.login(
+            host=host,
+            project=project_name,
+            api_key_value=api_key,
+        )
+
+        print(
+            "Connected to Hopsworks."
+        )
+
+        registry = (
+            project.get_model_registry()
+        )
+
+        registered_model = (
+            registry.python.create_model(
+                name=(
+                    "karachi_aqi_recursive_random_forest_72h"
+                ),
+
+                description=(
+                    "Karachi 0-500 AQI 72-hour "
+                    "recursive Random Forest using "
+                    "163 engineered pollution, "
+                    "weather and temporal features."
+                ),
+
+                metrics={
+                    "one_step_rmse": float(
+                        one_step_rmse
+                    ),
+
+                    "one_step_mae": float(
+                        one_step_mae
+                    ),
+
+                    "one_step_r2": float(
+                        one_step_r2
+                    ),
+
+                    "day1_rmse": float(
+                        results["Day 1"]["rmse"]
+                    ),
+
+                    "day1_mae": float(
+                        results["Day 1"]["mae"]
+                    ),
+
+                    "day1_r2": float(
+                        results["Day 1"]["r2"]
+                    ),
+
+                    "day2_rmse": float(
+                        results["Day 2"]["rmse"]
+                    ),
+
+                    "day2_mae": float(
+                        results["Day 2"]["mae"]
+                    ),
+
+                    "day2_r2": float(
+                        results["Day 2"]["r2"]
+                    ),
+
+                    "day3_rmse": float(
+                        results["Day 3"]["rmse"]
+                    ),
+
+                    "day3_mae": float(
+                        results["Day 3"]["mae"]
+                    ),
+
+                    "day3_r2": float(
+                        results["Day 3"]["r2"]
+                    ),
+
+                    "feature_count": float(
+                        len(feature_columns)
+                    ),
+                },
+            )
+        )
+
+        registered_model.save(
+            str(MODEL_ARTIFACT),
+            keep_original_files=True,
+        )
+
+        print(
+            "\nHopsworks Model Registry: PASSED"
+        )
+
+        print(
+            "Registered model:"
+        )
+
+        print(
+            "karachi_aqi_recursive_random_forest_72h"
+        )
+
+        return registered_model
+
+    except Exception as exc:
+        print(
+            "\nHopsworks Model Registry: FAILED"
+        )
+
+        print(
+            f"Registry error: {exc}"
+        )
+
+        return None
+
+
+registered_model = (
+    register_recursive_model()
+)
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+print(
+    "\n" + "=" * 60
+)
+
+print(
+    "RECURSIVE 72-HOUR PIPELINE COMPLETE"
+)
+
+print(
+    "=" * 60
+)
+
+for day_name in [
+    "Day 1",
+    "Day 2",
+    "Day 3",
+]:
+
+    print(
+        f"{day_name} R2: "
+        f"{results[day_name]['r2']:.6f} "
+        f"-> {results[day_name]['status']}"
+    )
+
+print(
+    "\nOne-step R2: "
+    f"{one_step_r2:.6f}"
+)
+
+print(
+    "\nModel artifacts:"
+)
+
+print(
+    MODEL_ARTIFACT
+)
+
+print(
+    IMPUTER_ARTIFACT
+)
+
+print(
+    METADATA_ARTIFACT
 )

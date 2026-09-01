@@ -1,4 +1,4 @@
-name: AQI Pipeline
+﻿name: AQI Pipeline
 
 on:
   push:
@@ -68,6 +68,6 @@ jobs:
           HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-        run: python training/train_models_v1.py
+        run: python recursive_72h.py
 
 
