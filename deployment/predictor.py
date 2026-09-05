@@ -1,4 +1,7 @@
-﻿import os
+﻿from __future__ import annotations
+
+import os
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -6,38 +9,59 @@ import pandas as pd
 
 
 class Predictor:
+    """Local inference wrapper for the final 163-feature recursive AQI model.
+
+    This API-side predictor intentionally does not depend on Hopsworks Model
+    Serving. It loads the verified local model artifacts committed with the
+    project and enforces the exact trained feature schema.
+    """
+
+    EXPECTED_FEATURE_COUNT = 163
 
     def __init__(self):
-        model_dir = (
-            os.environ.get("MODEL_FILES_PATH")
-            or os.environ.get("ARTIFACT_FILES_PATH")
-            or os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "models",
+        project_root = Path(
+            os.environ.get(
+                "MODEL_FILES_PATH",
+                Path(__file__).resolve().parents[1] / "models" / "recursive_72h",
             )
         )
 
-        model_path = os.path.join(
-            model_dir,
-            "random_forest_model.pkl",
-        )
-
-        metadata_path = os.path.join(
-            model_dir,
-            "feature_metadata.pkl",
-        )
-
-        self.model = joblib.load(model_path)
-        self.metadata = joblib.load(metadata_path)
-
-        self.feature_columns = self.metadata.get(
-            "feature_columns",
-            [],
-        )
-
-        if len(self.feature_columns) != 98:
+        if project_root.is_file():
             raise RuntimeError(
-                "Expected exactly 98 feature columns in metadata, "
+                f"MODEL_FILES_PATH points to a file, expected a model directory: {project_root}"
+            )
+
+        self.model_path = project_root / "recursive_random_forest_compressed.pkl"
+        self.imputer_path = project_root / "imputer.pkl"
+        self.metadata_path = project_root / "metadata.pkl"
+
+        missing = [
+            str(path)
+            for path in (
+                self.model_path,
+                self.imputer_path,
+                self.metadata_path,
+            )
+            if not path.exists()
+        ]
+
+        if missing:
+            raise FileNotFoundError(
+                "Missing final recursive model artifact(s): "
+                + ", ".join(missing)
+            )
+
+        self.model = joblib.load(self.model_path)
+        self.imputer = joblib.load(self.imputer_path)
+        self.metadata = joblib.load(self.metadata_path)
+
+        self.feature_columns = list(
+            self.metadata.get("feature_columns", [])
+        )
+
+        if len(self.feature_columns) != self.EXPECTED_FEATURE_COUNT:
+            raise RuntimeError(
+                "Expected exactly 163 feature columns in metadata, "
                 f"got {len(self.feature_columns)}"
             )
 
@@ -47,101 +71,88 @@ class Predictor:
             None,
         )
 
-        if model_feature_count != 98:
+        if model_feature_count != self.EXPECTED_FEATURE_COUNT:
             raise RuntimeError(
-                f"Expected 98 model features, "
+                "Expected exactly 163 model features, "
                 f"got {model_feature_count}"
             )
 
         print(
-            "Karachi AQI Random Forest loaded successfully."
+            "Karachi AQI Recursive Random Forest loaded successfully "
+            f"({self.EXPECTED_FEATURE_COUNT} features).",
+            flush=True,
         )
 
-    def predict(self, inputs):
+    def _normalise_input(self, inputs) -> pd.DataFrame:
+        """Convert supported JSON/pandas/list inputs into a feature dataframe."""
 
         if isinstance(inputs, dict):
             if "instances" in inputs:
                 inputs = inputs["instances"]
             elif "inputs" in inputs:
                 inputs = inputs["inputs"]
+            else:
+                # A named single-row feature mapping.
+                inputs = [inputs]
 
         if isinstance(inputs, pd.DataFrame):
             data = inputs.copy()
-
         elif isinstance(inputs, dict):
             data = pd.DataFrame([inputs])
-
         else:
             data = pd.DataFrame(inputs)
 
-        # Remove metadata/target columns that are not model features.
-        forbidden = [
-            "timestamp",
-            "aqi",
-            "target_aqi",
-            "id",
-            "current_aqi",
-        ]
+        if data.empty:
+            raise ValueError("Prediction input is empty.")
 
-        data = data.drop(
-            columns=[
-                column
-                for column in forbidden
-                if column in data.columns
-            ],
-            errors="ignore",
-        )
+        return data
 
+    def predict(self, inputs):
+        data = self._normalise_input(inputs)
+
+        # Named-feature input: enforce the exact trained order.
         missing_features = [
-            column
-            for column in self.feature_columns
-            if column not in data.columns
+            feature
+            for feature in self.feature_columns
+            if feature not in data.columns
         ]
 
-        # When named features are supplied, enforce the trained schema.
-        # For a raw 98-value array, preserve the supplied order.
-        if missing_features and data.shape[1] != 98:
+        if not missing_features:
+            data = data[self.feature_columns]
+        elif data.shape[1] == self.EXPECTED_FEATURE_COUNT:
+            # Raw 163-value arrays are accepted in supplied order.
+            pass
+        else:
             raise ValueError(
                 "Prediction input is missing model features: "
                 + ", ".join(missing_features)
             )
 
-        if data.shape[1] != 98:
+        if data.shape[1] != self.EXPECTED_FEATURE_COUNT:
             raise ValueError(
-                f"Expected exactly 98 input features, "
+                f"Expected exactly {self.EXPECTED_FEATURE_COUNT} input features, "
                 f"received {data.shape[1]}"
             )
 
-        if not missing_features:
-            data = data[
-                self.feature_columns
-            ]
-
-        data = data.apply(
-            pd.to_numeric,
-            errors="coerce",
-        )
-
-        data = data.replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
+        data = data.apply(pd.to_numeric, errors="coerce")
+        data = data.replace([np.inf, -np.inf], np.nan)
 
         if data.isna().any().any():
-            missing_values = data.columns[
-                data.isna().any()
-            ].tolist()
-
+            bad_columns = data.columns[data.isna().any()].tolist()
             raise ValueError(
-                "Prediction input contains missing or "
-                "non-numeric feature values in: "
-                + ", ".join(missing_values)
+                "Prediction input contains missing or non-numeric values in: "
+                + ", ".join(map(str, bad_columns))
             )
 
-        # The model was fitted without sklearn feature names.
-        # Pass a NumPy array to avoid the feature-name warning.
-        prediction = self.model.predict(
-            data.to_numpy()
+        transformed = self.imputer.transform(
+            pd.DataFrame(data, columns=self.feature_columns)
+        )
+
+        prediction = self.model.predict(transformed)
+        prediction = np.clip(
+            np.asarray(prediction, dtype=float),
+            0,
+            500,
         )
 
         return prediction.tolist()
