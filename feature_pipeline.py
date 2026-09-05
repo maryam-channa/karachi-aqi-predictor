@@ -1,48 +1,35 @@
 """
 Production AQI feature pipeline for Karachi.
 
-Purpose
--------
-1. Fetch the current weather and pollutant observation from OpenWeather.
-2. Append the raw observation to a dedicated persistent Hopsworks raw
-   feature group (aqi_raw_observations, v1).
-3. Maintain a local raw cache at data/historical_aqi.csv.
-4. Build the exact 98-feature schema used by the verified
-   RandomForestRegressor.
-5. Write current, unlabeled 98-feature rows to a separate Hopsworks
-   serving feature group: aqi_serving_features, version 1.
-6. Do not fabricate a next-hour target; labels are created retrospectively
-   by the historical backfill/training pipeline.
-7. Never fabricate missing hourly history.
+Final production alignment
+--------------------------
+1. Fetch live weather + pollutant observations from OpenWeather.
+2. Maintain a local live observation cache.
+3. Recalculate the same modeling-oriented 0-500 AQI definition used by
+   calculate_aqi_0_500.py whenever enough continuous history exists.
+4. Combine the verified 2-year AQI/weather dataset with live observations.
+5. Build the exact 163-feature schema used by the final Recursive
+   Random Forest model.
+6. Save the latest 163-feature inference row locally.
+7. Persist the raw live observation to Hopsworks on a best-effort basis.
+   A Hopsworks upload/materialization failure must NOT fail the GitHub job.
+8. Never fabricate missing hourly observations. Until a genuine 24-hour
+   contiguous live window exists, raw collection succeeds but feature
+   generation is deferred.
 
 Important:
-- The current trained model has exactly 98 features.
-- The model itself does NOT currently consume weather variables.
-  Weather is collected as part of the raw pipeline for future feature
-  expansion, but the model feature schema remains exactly 98 columns.
-- A model-feature row is written only when the required 24-hour lag history
-  is genuinely available and hourly-contiguous.
-
-Environment variables required
--------------------------------
-HOPSWORKS_HOST
-HOPSWORKS_PROJECT
-HOPSWORKS_API_KEY
-OPENWEATHER_API_KEY
-
-Optional
---------
-RAW_FEATURE_GROUP_NAME=aqi_raw_observations
-RAW_FEATURE_GROUP_VERSION=1
-CITY_NAME=Karachi
+- OpenWeather main.aqi is a 1-5 index and is stored only as
+  openweather_aqi/raw metadata.
+- The final model uses the custom 0-500 AQI definition from
+  calculate_aqi_0_500.py.
+- The final model uses exactly 163 features.
+- Weather is part of the final model feature schema.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
-from datetime import datetime, timezone
 
 import hopsworks
 import numpy as np
@@ -56,177 +43,168 @@ import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-RAW_CACHE_PATH = DATA_DIR / "historical_aqi.csv"
+
+VERIFIED_DATASET_PATH = DATA_DIR / "karachi_aqi_weather_2years.csv"
+RAW_HISTORY_PATH = DATA_DIR / "historical_aqi_2years_raw.csv"
+LIVE_CACHE_PATH = DATA_DIR / "live_aqi_weather.csv"
+LATEST_FEATURE_ROW_PATH = DATA_DIR / "latest_recursive_163_features.csv"
+
+MODEL_METADATA_PATH = (
+    BASE_DIR / "models" / "recursive_72h" / "metadata.pkl"
+)
 
 HOPSWORKS_HOST = os.getenv(
     "HOPSWORKS_HOST",
     "eu-west.cloud.hopsworks.ai",
 )
-
 HOPSWORKS_PROJECT = os.getenv(
     "HOPSWORKS_PROJECT",
     "noismore",
 )
-
-HOPSWORKS_API_KEY = os.getenv(
-    "HOPSWORKS_API_KEY",
-)
-
-OPENWEATHER_API_KEY = os.getenv(
-    "OPENWEATHER_API_KEY",
-)
+HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
 LAT = 24.8607
 LON = 67.0011
-CITY_NAME = os.getenv("CITY_NAME", "Karachi")
 
 RAW_FEATURE_GROUP_NAME = os.getenv(
     "RAW_FEATURE_GROUP_NAME",
     "aqi_raw_observations",
 )
-
 RAW_FEATURE_GROUP_VERSION = int(
-    os.getenv(
-        "RAW_FEATURE_GROUP_VERSION",
-        "1",
-    )
+    os.getenv("RAW_FEATURE_GROUP_VERSION", "1")
 )
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 30
 HOPSWORKS_READ_TIMEOUT = 300
 
 
 # ============================================================
-# EXACT 98-FEATURE MODEL SCHEMA
+# FINAL 163-FEATURE SCHEMA
 # ============================================================
 
-FEATURE_COLUMNS = [
-    "pm25",
-    "pm10",
-    "no2",
-    "o3",
-    "hour",
-    "day_of_week",
-    "day_of_month",
-    "month",
-    "week_of_year",
-    "is_weekend",
-    "is_morning",
-    "is_afternoon",
-    "is_evening",
-    "is_night",
-    "hour_sin",
-    "hour_cos",
-    "dow_sin",
-    "dow_cos",
-    "month_sin",
-    "month_cos",
+RECURSIVE_LAGS = [1, 2, 3, 6, 12, 24]
+RECURSIVE_WINDOWS = [3, 6, 12, 24]
 
-    "pm25_lag_1h",
-    "pm25_lag_2h",
-    "pm25_lag_3h",
-    "pm25_lag_6h",
-    "pm25_lag_12h",
-    "pm25_lag_24h",
-
-    "pm10_lag_1h",
-    "pm10_lag_2h",
-    "pm10_lag_3h",
-    "pm10_lag_6h",
-    "pm10_lag_12h",
-    "pm10_lag_24h",
-
-    "no2_lag_1h",
-    "no2_lag_2h",
-    "no2_lag_3h",
-    "no2_lag_6h",
-    "no2_lag_12h",
-    "no2_lag_24h",
-
-    "o3_lag_1h",
-    "o3_lag_2h",
-    "o3_lag_3h",
-    "o3_lag_6h",
-    "o3_lag_12h",
-    "o3_lag_24h",
-
-    "aqi_lag_1h",
-    "aqi_lag_2h",
-    "aqi_lag_3h",
-    "aqi_lag_6h",
-    "aqi_lag_12h",
-    "aqi_lag_24h",
-
-    "pm25_rolling_mean_3h",
-    "pm25_rolling_std_3h",
-    "pm25_rolling_mean_6h",
-    "pm25_rolling_std_6h",
-    "pm25_rolling_mean_12h",
-    "pm25_rolling_std_12h",
-    "pm25_rolling_mean_24h",
-    "pm25_rolling_std_24h",
-
-    "pm10_rolling_mean_3h",
-    "pm10_rolling_std_3h",
-    "pm10_rolling_mean_6h",
-    "pm10_rolling_std_6h",
-    "pm10_rolling_mean_12h",
-    "pm10_rolling_std_12h",
-    "pm10_rolling_mean_24h",
-    "pm10_rolling_std_24h",
-
-    "no2_rolling_mean_3h",
-    "no2_rolling_std_3h",
-    "no2_rolling_mean_6h",
-    "no2_rolling_std_6h",
-    "no2_rolling_mean_12h",
-    "no2_rolling_std_12h",
-    "no2_rolling_mean_24h",
-    "no2_rolling_std_24h",
-
-    "o3_rolling_mean_3h",
-    "o3_rolling_std_3h",
-    "o3_rolling_mean_6h",
-    "o3_rolling_std_6h",
-    "o3_rolling_mean_12h",
-    "o3_rolling_std_12h",
-    "o3_rolling_mean_24h",
-    "o3_rolling_std_24h",
-
-    "aqi_rolling_mean_3h",
-    "aqi_rolling_std_3h",
-    "aqi_rolling_mean_6h",
-    "aqi_rolling_std_6h",
-    "aqi_rolling_mean_12h",
-    "aqi_rolling_std_12h",
-    "aqi_rolling_mean_24h",
-    "aqi_rolling_std_24h",
-
-    "pm25_pm10_ratio",
-    "pm10_pm25_ratio",
-    "pm25_no2_ratio",
-    "o3_no2_ratio",
-
-    "pm25_change_1h",
-    "pm10_change_1h",
-    "no2_change_1h",
-    "o3_change_1h",
-]
-
-RAW_COLUMNS = [
-    "timestamp",
+RECURSIVE_VARIABLES = [
     "aqi",
     "pm25",
     "pm10",
     "no2",
     "o3",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "cloud_cover",
 ]
 
-if len(FEATURE_COLUMNS) != 98:
+try:
+    import joblib
+
+    _metadata = joblib.load(MODEL_METADATA_PATH)
+    FEATURE_COLUMNS = list(_metadata["feature_columns"])
+except Exception as exc:
     raise RuntimeError(
-        f"Internal schema error: expected 98 features, "
+        "Could not load final recursive model metadata from "
+        f"{MODEL_METADATA_PATH}: {exc}"
+    ) from exc
+
+if len(FEATURE_COLUMNS) != 163:
+    raise RuntimeError(
+        f"Final model metadata must contain exactly 163 features; "
         f"found {len(FEATURE_COLUMNS)}."
     )
+
+
+# ============================================================
+# AQI BREAKPOINTS — same definition as calculate_aqi_0_500.py
+# ============================================================
+
+PM25_BREAKPOINTS = [
+    (0.0, 9.0, 0, 50),
+    (9.1, 35.4, 51, 100),
+    (35.5, 55.4, 101, 150),
+    (55.5, 125.4, 151, 200),
+    (125.5, 225.4, 201, 300),
+    (225.5, 325.4, 301, 500),
+]
+
+PM10_BREAKPOINTS = [
+    (0, 54, 0, 50),
+    (55, 154, 51, 100),
+    (155, 254, 101, 150),
+    (255, 354, 151, 200),
+    (355, 424, 201, 300),
+    (425, 604, 301, 500),
+]
+
+O3_BREAKPOINTS = [
+    (0.000, 0.054, 0, 50),
+    (0.055, 0.070, 51, 100),
+    (0.071, 0.085, 101, 150),
+    (0.086, 0.105, 151, 200),
+    (0.106, 0.200, 201, 300),
+]
+
+CO_BREAKPOINTS = [
+    (0.0, 4.4, 0, 50),
+    (4.5, 9.4, 51, 100),
+    (9.5, 12.4, 101, 150),
+    (12.5, 15.4, 151, 200),
+    (15.5, 30.4, 201, 300),
+    (30.5, 50.4, 301, 500),
+]
+
+NO2_BREAKPOINTS = [
+    (0, 53, 0, 50),
+    (54, 100, 51, 100),
+    (101, 360, 101, 150),
+    (361, 649, 151, 200),
+    (650, 1249, 201, 300),
+    (1250, 2049, 301, 500),
+]
+
+SO2_BREAKPOINTS = [
+    (0, 35, 0, 50),
+    (36, 75, 51, 100),
+    (76, 185, 101, 150),
+    (186, 304, 151, 200),
+]
+
+
+def calculate_subindex(concentration, breakpoints):
+    if concentration is None or pd.isna(concentration):
+        return np.nan
+
+    concentration = float(concentration)
+    if concentration < 0:
+        return np.nan
+
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c_low <= concentration <= c_high:
+            if c_high == c_low:
+                return float(i_high)
+
+            value = (
+                (i_high - i_low)
+                / (c_high - c_low)
+            ) * (concentration - c_low) + i_low
+
+            return float(value)
+
+    if concentration > breakpoints[-1][1]:
+        return 500.0
+
+    return np.nan
+
+
+def ug_m3_to_ppm(value, molecular_weight):
+    return float(value) * 24.45 / (molecular_weight * 1000.0)
+
+
+def ug_m3_to_ppb(value, molecular_weight):
+    return float(value) * 24.45 / molecular_weight
 
 
 # ============================================================
@@ -238,36 +216,39 @@ def log(message: str) -> None:
 
 
 def require_environment() -> None:
-
-    missing = []
-
-    if not HOPSWORKS_API_KEY:
-        missing.append("HOPSWORKS_API_KEY")
-
     if not OPENWEATHER_API_KEY:
-        missing.append("OPENWEATHER_API_KEY")
-
-    if missing:
         raise RuntimeError(
-            "Missing environment variable(s): "
-            + ", ".join(missing)
+            "Missing environment variable: OPENWEATHER_API_KEY"
         )
 
 
-def connect_hopsworks():
-    log("Connecting to Hopsworks...")
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    project = hopsworks.login(
-        host=HOPSWORKS_HOST,
-        project=HOPSWORKS_PROJECT,
-        api_key_value=HOPSWORKS_API_KEY,
+    if "timestamp" not in out.columns:
+        raise ValueError("Dataframe must contain timestamp.")
+
+    out["timestamp"] = pd.to_datetime(
+        out["timestamp"],
+        utc=True,
+        errors="coerce",
+    ).dt.floor("h")
+
+    for column in out.columns:
+        if column != "timestamp":
+            out[column] = pd.to_numeric(
+                out[column],
+                errors="coerce",
+            )
+
+    out = (
+        out.dropna(subset=["timestamp"])
+        .drop_duplicates("timestamp", keep="last")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
     )
 
-    fs = project.get_feature_store()
-
-    log("Hopsworks Feature Store connection established.")
-
-    return project, fs
+    return out
 
 
 # ============================================================
@@ -275,52 +256,33 @@ def connect_hopsworks():
 # ============================================================
 
 def fetch_openweather_observation() -> tuple[dict, dict]:
-    """
-    Fetch current weather and current pollutant/AQI observations.
-
-    OpenWeather's air-pollution response provides:
-      main.aqi: 1..5
-      components.pm2_5
-      components.pm10
-      components.no2
-      components.o3
-    """
-
     weather_url = (
         "https://api.openweathermap.org/data/2.5/weather"
-        f"?lat={LAT}"
-        f"&lon={LON}"
-        "&units=metric"
+        f"?lat={LAT}&lon={LON}&units=metric"
         f"&appid={OPENWEATHER_API_KEY}"
     )
 
     pollution_url = (
         "https://api.openweathermap.org/data/2.5/air_pollution"
-        f"?lat={LAT}"
-        f"&lon={LON}"
+        f"?lat={LAT}&lon={LON}"
         f"&appid={OPENWEATHER_API_KEY}"
     )
 
     log("Fetching current weather from OpenWeather...")
-
     weather_response = requests.get(
         weather_url,
         timeout=REQUEST_TIMEOUT,
     )
-
     weather_response.raise_for_status()
 
-    weather = weather_response.json()
-
-    log("Fetching current pollutant/AQI data from OpenWeather...")
-
+    log("Fetching current pollutant data from OpenWeather...")
     pollution_response = requests.get(
         pollution_url,
         timeout=REQUEST_TIMEOUT,
     )
-
     pollution_response.raise_for_status()
 
+    weather = weather_response.json()
     pollution = pollution_response.json()
 
     if not pollution.get("list"):
@@ -334,42 +296,31 @@ def fetch_openweather_observation() -> tuple[dict, dict]:
 def normalize_current_observation(
     weather: dict,
     pollution: dict,
-) -> tuple[pd.DataFrame, dict]:
-    """
-    Convert OpenWeather responses into:
-      - one raw AQI/pollution row
-      - weather metadata for logging
-
-    Timestamp is taken from the OpenWeather air-pollution record.
-    """
+) -> pd.DataFrame:
 
     entry = pollution["list"][0]
-
     components = entry.get("components", {})
     main = entry.get("main", {})
 
-    timestamp = (
-        pd.to_datetime(
-            entry.get("dt"),
-            unit="s",
-            utc=True,
-        )
-        .floor("h")
-    )
+    timestamp = pd.to_datetime(
+        entry.get("dt"),
+        unit="s",
+        utc=True,
+    ).floor("h")
 
-    aqi = main.get("aqi")
-
-    required_values = {
-        "aqi": aqi,
+    required = {
+        "openweather_aqi": main.get("aqi"),
         "pm25": components.get("pm2_5"),
         "pm10": components.get("pm10"),
         "no2": components.get("no2"),
         "o3": components.get("o3"),
+        "so2": components.get("so2"),
+        "co": components.get("co"),
+        "nh3": components.get("nh3"),
     }
 
     missing = [
-        name
-        for name, value in required_values.items()
+        name for name, value in required.items()
         if value is None
     ]
 
@@ -379,120 +330,637 @@ def normalize_current_observation(
             + ", ".join(missing)
         )
 
-    raw_row = pd.DataFrame(
-        [{
-            "timestamp": timestamp,
-            "aqi": float(aqi),
-            "pm25": float(components["pm2_5"]),
-            "pm10": float(components["pm10"]),
-            "no2": float(components["no2"]),
-            "o3": float(components["o3"]),
-        }]
-    )
-
-    weather_info = {
-        "temperature_c": weather.get("main", {}).get("temp"),
-        "humidity_percent": weather.get("main", {}).get("humidity"),
-        "pressure_hpa": weather.get("main", {}).get("pressure"),
-        "wind_speed_mps": weather.get("wind", {}).get("speed"),
-        "cloud_percent": weather.get("clouds", {}).get("all"),
-    }
-
-    return raw_row, weather_info
+    return pd.DataFrame([{
+        "timestamp": timestamp,
+        "openweather_aqi": float(required["openweather_aqi"]),
+        "pm25": float(required["pm25"]),
+        "pm10": float(required["pm10"]),
+        "no2": float(required["no2"]),
+        "o3": float(required["o3"]),
+        "so2": float(required["so2"]),
+        "co": float(required["co"]),
+        "nh3": float(required["nh3"]),
+        "temperature_2m": float(
+            weather.get("main", {}).get("temp")
+        ),
+        "relative_humidity_2m": float(
+            weather.get("main", {}).get("humidity")
+        ),
+        "surface_pressure": float(
+            weather.get("main", {}).get("pressure")
+        ),
+        "wind_speed_10m": float(
+            weather.get("wind", {}).get("speed")
+        ) * 3.6,
+        "cloud_cover": float(
+            weather.get("clouds", {}).get("all")
+        ),
+    }])
 
 
 # ============================================================
-# RAW HISTORY
+# LOCAL LIVE CACHE
 # ============================================================
 
-def clean_raw_history(df: pd.DataFrame) -> pd.DataFrame:
+LIVE_COLUMNS = [
+    "timestamp",
+    "openweather_aqi",
+    "pm25",
+    "pm10",
+    "no2",
+    "o3",
+    "so2",
+    "co",
+    "nh3",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "surface_pressure",
+    "wind_speed_10m",
+    "cloud_cover",
+]
+
+
+def load_live_cache() -> pd.DataFrame:
+    if not LIVE_CACHE_PATH.exists():
+        return pd.DataFrame(columns=LIVE_COLUMNS)
+
+    df = pd.read_csv(LIVE_CACHE_PATH)
 
     missing = [
-        c
-        for c in RAW_COLUMNS
+        c for c in LIVE_COLUMNS
         if c not in df.columns
     ]
 
     if missing:
+        log(
+            "WARNING: Existing live cache has an older schema; "
+            f"rebuilding it. Missing: {', '.join(missing)}"
+        )
+        return pd.DataFrame(columns=LIVE_COLUMNS)
+
+    return clean_dataframe(df[LIVE_COLUMNS])
+
+
+def save_live_cache(df: pd.DataFrame) -> pd.DataFrame:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    clean = clean_dataframe(df)
+
+    clean.to_csv(
+        LIVE_CACHE_PATH,
+        index=False,
+    )
+
+    log(f"Local live cache saved: {len(clean)} rows.")
+    return clean
+
+
+# ============================================================
+# EXACT 0-500 AQI CALCULATION FOR COMBINED RAW HISTORY
+# ============================================================
+
+def calculate_0_500_aqi_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reproduce the same AQI construction used by
+    calculate_aqi_0_500.py.
+
+    Rows without a complete required averaging window remain NaN.
+    Missing hours are never fabricated.
+    """
+
+    required = [
+        "timestamp",
+        "pm25",
+        "pm10",
+        "no2",
+        "o3",
+        "so2",
+        "co",
+    ]
+
+    missing = [
+        c for c in required
+        if c not in raw.columns
+    ]
+
+    if missing:
         raise ValueError(
-            "Raw history is missing columns: "
+            "Raw AQI history is missing: "
             + ", ".join(missing)
         )
 
-    df = df[RAW_COLUMNS].copy()
+    df = clean_dataframe(raw[required])
 
-    df["timestamp"] = (
-        pd.to_datetime(
-            df["timestamp"],
-            utc=True,
-            errors="coerce",
-        )
-        .dt.floor("h")
+    df["pm25_24h"] = (
+        df["pm25"]
+        .rolling(window=24, min_periods=24)
+        .mean()
     )
 
-    for column in RAW_COLUMNS[1:]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
+    df["pm10_24h"] = (
+        df["pm10"]
+        .rolling(window=24, min_periods=24)
+        .mean()
+    )
+
+    df["o3_8h"] = (
+        df["o3"]
+        .rolling(window=8, min_periods=8)
+        .mean()
+    )
+
+    df["co_8h"] = (
+        df["co"]
+        .rolling(window=8, min_periods=8)
+        .mean()
+    )
+
+    df["aqi_pm25"] = df["pm25_24h"].apply(
+        lambda x: calculate_subindex(
+            x,
+            PM25_BREAKPOINTS,
+        )
+    )
+
+    df["aqi_pm10"] = df["pm10_24h"].apply(
+        lambda x: calculate_subindex(
+            x,
+            PM10_BREAKPOINTS,
+        )
+    )
+
+    df["aqi_o3"] = (
+        df["o3_8h"]
+        .apply(
+            lambda x: (
+                calculate_subindex(
+                    ug_m3_to_ppm(x, 48.00),
+                    O3_BREAKPOINTS,
+                )
+                if pd.notna(x)
+                else np.nan
+            )
+        )
+    )
+
+    df["aqi_co"] = (
+        df["co_8h"]
+        .apply(
+            lambda x: (
+                calculate_subindex(
+                    ug_m3_to_ppm(x, 28.01),
+                    CO_BREAKPOINTS,
+                )
+                if pd.notna(x)
+                else np.nan
+            )
+        )
+    )
+
+    df["aqi_no2"] = (
+        df["no2"]
+        .apply(
+            lambda x: calculate_subindex(
+                ug_m3_to_ppb(x, 46.0055),
+                NO2_BREAKPOINTS,
+            )
+        )
+    )
+
+    df["aqi_so2"] = (
+        df["so2"]
+        .apply(
+            lambda x: calculate_subindex(
+                ug_m3_to_ppb(x, 64.066),
+                SO2_BREAKPOINTS,
+            )
+        )
+    )
+
+    aqi_columns = [
+        "aqi_pm25",
+        "aqi_pm10",
+        "aqi_o3",
+        "aqi_co",
+        "aqi_no2",
+        "aqi_so2",
+    ]
+
+    df["aqi"] = (
+        df[aqi_columns]
+        .max(axis=1, skipna=True)
+        .clip(lower=0, upper=500)
+        .round()
+    )
+
+    return df[
+        ["timestamp", "aqi"]
+    ].copy()
+
+
+# ============================================================
+# HISTORY + LIVE COMBINATION
+# ============================================================
+
+def build_raw_history_for_aqi(
+    live_cache: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if not RAW_HISTORY_PATH.exists():
+        raise FileNotFoundError(
+            f"Verified raw historical dataset not found: "
+            f"{RAW_HISTORY_PATH}"
         )
 
-    df = (
-        df
-        .dropna(subset=RAW_COLUMNS)
-        .drop_duplicates(
-            subset=["timestamp"],
+    historical = pd.read_csv(RAW_HISTORY_PATH)
+
+    required = [
+        "timestamp",
+        "pm25",
+        "pm10",
+        "no2",
+        "o3",
+        "so2",
+        "co",
+        "nh3",
+    ]
+
+    missing = [
+        c for c in required
+        if c not in historical.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Verified raw historical dataset is missing: "
+            + ", ".join(missing)
+        )
+
+    historical = historical[required].copy()
+    historical = clean_dataframe(historical)
+
+    live_raw = live_cache[
+        [
+            "timestamp",
+            "pm25",
+            "pm10",
+            "no2",
+            "o3",
+            "so2",
+            "co",
+            "nh3",
+        ]
+    ].copy()
+
+    merged = pd.concat(
+        [historical, live_raw],
+        ignore_index=True,
+    )
+
+    return clean_dataframe(merged)
+
+
+def build_model_history(
+    live_cache: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build the feature-engineering history from:
+      - verified 2-year AQI + weather data
+      - live observations collected by this pipeline
+
+    The verified historical dataset already contains the final 0-500 AQI.
+    Live AQI is recalculated using the same formula.
+    """
+
+    historical_path = VERIFIED_DATASET_PATH
+
+    if not historical_path.exists():
+        raise FileNotFoundError(
+            f"Verified combined dataset not found: "
+            f"{historical_path}"
+        )
+
+    historical = pd.read_csv(historical_path)
+
+    required_historical = [
+        "timestamp",
+        "aqi",
+        "pm25",
+        "pm10",
+        "no2",
+        "o3",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "surface_pressure",
+        "wind_speed_10m",
+        "cloud_cover",
+    ]
+
+    missing = [
+        c for c in required_historical
+        if c not in historical.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Verified combined dataset is missing: "
+            + ", ".join(missing)
+        )
+
+    historical = historical[required_historical].copy()
+    historical = clean_dataframe(historical)
+
+    # Recalculate exact 0-500 AQI for live records.
+    combined_raw = build_raw_history_for_aqi(live_cache)
+    live_aqi = calculate_0_500_aqi_from_raw(combined_raw)
+
+    live_joined = live_cache[
+        [
+            "timestamp",
+            "pm25",
+            "pm10",
+            "no2",
+            "o3",
+            "temperature_2m",
+            "relative_humidity_2m",
+            "surface_pressure",
+            "wind_speed_10m",
+            "cloud_cover",
+        ]
+    ].merge(
+        live_aqi,
+        on="timestamp",
+        how="left",
+    )
+
+    live_joined = live_joined[
+        [
+            "timestamp",
+            "aqi",
+            "pm25",
+            "pm10",
+            "no2",
+            "o3",
+            "temperature_2m",
+            "relative_humidity_2m",
+            "surface_pressure",
+            "wind_speed_10m",
+            "cloud_cover",
+        ]
+    ]
+
+    model_history = pd.concat(
+        [historical, live_joined],
+        ignore_index=True,
+    )
+
+    model_history = clean_dataframe(model_history)
+
+    return model_history
+
+
+# ============================================================
+# CONTIGUOUS HISTORY CHECK
+# ============================================================
+
+def check_contiguous_history(
+    history: pd.DataFrame,
+    timestamp: pd.Timestamp,
+) -> tuple[bool, str]:
+
+    valid = history[
+        history["timestamp"] < timestamp
+    ].copy()
+
+    valid = valid.dropna(
+        subset=[
+            "aqi",
+            "pm25",
+            "pm10",
+            "no2",
+            "o3",
+            "temperature_2m",
+            "relative_humidity_2m",
+            "surface_pressure",
+            "wind_speed_10m",
+            "cloud_cover",
+        ]
+    )
+
+    if len(valid) < 24:
+        return (
+            False,
+            "Fewer than 24 complete prior observations are available.",
+        )
+
+    required = valid.tail(24)["timestamp"].sort_values()
+
+    expected = pd.date_range(
+        end=timestamp - pd.Timedelta(hours=1),
+        periods=24,
+        freq="1h",
+        tz="UTC",
+    )
+
+    if (
+        len(required) != 24
+        or not (
+            pd.DatetimeIndex(required).to_numpy()
+            == pd.DatetimeIndex(expected).to_numpy()
+        ).all()
+    ):
+        return (
+            False,
+            "The preceding 24 hours are not complete and contiguous. "
+            "The pipeline will not fabricate missing observations.",
+        )
+
+    return True, "24-hour history is contiguous."
+
+
+# ============================================================
+# EXACT 163-FEATURE ENGINEERING
+# ============================================================
+
+def build_recursive_163_features(
+    history: pd.DataFrame,
+    timestamp: pd.Timestamp,
+) -> pd.DataFrame:
+
+    history = history.copy()
+    history["timestamp"] = pd.to_datetime(
+        history["timestamp"],
+        utc=True,
+    )
+
+    history = (
+        history.drop_duplicates(
+            "timestamp",
             keep="last",
         )
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
 
-    return df
+    timestamp = pd.Timestamp(timestamp).tz_convert("UTC")
 
-
-def load_local_raw_cache() -> pd.DataFrame:
-
-    if not RAW_CACHE_PATH.exists():
-        return pd.DataFrame(
-            columns=RAW_COLUMNS
+    if len(history) < 25:
+        raise ValueError(
+            "At least 25 hours of history are required."
         )
 
-    df = pd.read_csv(RAW_CACHE_PATH)
+    current = history.iloc[-1]
 
-    return clean_raw_history(df)
+    # The trained schema starts with 10 calendar features.
+    hour = timestamp.hour
+    dow = timestamp.dayofweek
+    month = timestamp.month
+    doy = timestamp.dayofyear
 
+    row = {
+        "hour": hour,
+        "day_of_week": dow,
+        "month": month,
+        "day_of_year": doy,
+        "hour_sin": np.sin(2 * np.pi * hour / 24),
+        "hour_cos": np.cos(2 * np.pi * hour / 24),
+        "dow_sin": np.sin(2 * np.pi * dow / 7),
+        "dow_cos": np.cos(2 * np.pi * dow / 7),
+        "doy_sin": np.sin(2 * np.pi * doy / 365.25),
+        "doy_cos": np.cos(2 * np.pi * doy / 365.25),
+    }
 
-def save_local_raw_cache(df: pd.DataFrame) -> None:
+    for variable in RECURSIVE_VARIABLES:
+        row[variable] = float(current[variable])
 
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+        for lag in RECURSIVE_LAGS:
+            row[f"{variable}_lag_{lag}h"] = float(
+                history[variable].iloc[-lag]
+            )
+
+    for variable in RECURSIVE_VARIABLES:
+        for window in RECURSIVE_WINDOWS:
+            values = (
+                history[variable]
+                .tail(window)
+                .to_numpy(dtype=float)
+            )
+
+            row[f"{variable}_mean_{window}h"] = float(
+                values.mean()
+            )
+            row[f"{variable}_std_{window}h"] = float(
+                values.std(ddof=1)
+                if len(values) > 1
+                else 0.0
+            )
+
+    for window in [6, 12, 24]:
+        values = (
+            history["aqi"]
+            .tail(window)
+            .to_numpy(dtype=float)
+        )
+        x = np.arange(len(values), dtype=float)
+
+        row[f"aqi_slope_{window}h"] = float(
+            np.polyfit(x, values, 1)[0]
+        )
+
+    result = pd.DataFrame([row])
+
+    missing = [
+        feature
+        for feature in FEATURE_COLUMNS
+        if feature not in result.columns
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "163-feature construction failed. Missing: "
+            + ", ".join(missing)
+        )
+
+    result = result[FEATURE_COLUMNS]
+
+    result = result.replace(
+        [np.inf, -np.inf],
+        np.nan,
     )
 
-    clean = clean_raw_history(df)
+    if result.isna().any().any():
+        bad = result.columns[
+            result.isna().any()
+        ].tolist()
 
-    clean.to_csv(
-        RAW_CACHE_PATH,
+        raise RuntimeError(
+            "163-feature row contains NaN values in: "
+            + ", ".join(bad)
+        )
+
+    return result
+
+
+# ============================================================
+# LOCAL FEATURE OUTPUT
+# ============================================================
+
+def save_latest_feature_row(
+    feature_row: pd.DataFrame,
+    timestamp: pd.Timestamp,
+) -> None:
+
+    output = feature_row.copy()
+    output.insert(
+        0,
+        "timestamp",
+        pd.Timestamp(timestamp).tz_convert("UTC"),
+    )
+
+    output.to_csv(
+        LATEST_FEATURE_ROW_PATH,
         index=False,
     )
 
     log(
-        f"Local raw cache saved: {len(clean)} rows."
+        f"Latest 163-feature row saved locally: "
+        f"{LATEST_FEATURE_ROW_PATH}"
     )
 
 
-def get_or_create_raw_feature_group(fs):
-    """Get or create the persistent raw hourly observation Feature Group."""
+# ============================================================
+# HOPSWORKS — BEST EFFORT ONLY
+# ============================================================
 
+def connect_hopsworks():
+    if not HOPSWORKS_API_KEY:
+        raise RuntimeError(
+            "HOPSWORKS_API_KEY is not configured."
+        )
+
+    log("Connecting to Hopsworks...")
+
+    project = hopsworks.login(
+        host=HOPSWORKS_HOST,
+        project=HOPSWORKS_PROJECT,
+        api_key_value=HOPSWORKS_API_KEY,
+    )
+
+    fs = project.get_feature_store()
+
+    log("Hopsworks Feature Store connection established.")
+
+    return fs
+
+
+def get_or_create_raw_feature_group(fs):
     try:
         fg = fs.get_feature_group(
             name=RAW_FEATURE_GROUP_NAME,
             version=RAW_FEATURE_GROUP_VERSION,
         )
-
         if fg is not None:
             return fg
-
     except Exception:
         pass
 
@@ -501,12 +969,13 @@ def get_or_create_raw_feature_group(fs):
         f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}..."
     )
 
-    fg = fs.create_feature_group(
+    return fs.create_feature_group(
         name=RAW_FEATURE_GROUP_NAME,
         version=RAW_FEATURE_GROUP_VERSION,
         description=(
-            "Persistent Karachi hourly raw AQI and pollutant observations "
-            "used for production feature generation."
+            "Persistent Karachi hourly raw OpenWeather observations. "
+            "The aqi field in this legacy raw group is the OpenWeather "
+            "1-5 index; final 0-500 AQI is derived locally."
         ),
         primary_key=["id"],
         event_time="timestamp",
@@ -514,47 +983,37 @@ def get_or_create_raw_feature_group(fs):
         time_travel_format="DELTA",
     )
 
-    if fg is None:
-        raise RuntimeError(
-            "Failed to create the persistent raw Feature Group."
-        )
-
-    return fg
-
 
 def write_raw_observation_to_hopsworks(
     fs,
     current_row: pd.DataFrame,
 ) -> None:
-    """Persist the current raw observation for future hourly runs."""
+    """
+    Keep the existing raw Feature Group contract so this pipeline
+    does not attempt to migrate its schema while Hopsworks quota is
+    constrained.
+    """
 
     row = current_row.copy()
 
-    row["timestamp"] = pd.to_datetime(
-        row["timestamp"],
-        utc=True,
-    )
-
-    # One deterministic ID per UTC hour.
     row["id"] = (
         row["timestamp"]
-        .map(lambda x: int(x.timestamp() // 3600))
+        .map(lambda x: int(pd.Timestamp(x).timestamp() // 3600))
         .astype("int64")
     )
 
-    row = row[
-        [
-            "id",
-            "timestamp",
-            "aqi",
-            "pm25",
-            "pm10",
-            "no2",
-            "o3",
-        ]
-    ].copy()
-
-    row["aqi"] = row["aqi"].astype("int64")
+    output = pd.DataFrame({
+        "id": row["id"].astype("int64"),
+        "timestamp": pd.to_datetime(
+            row["timestamp"],
+            utc=True,
+        ),
+        "aqi": row["openweather_aqi"].astype("int64"),
+        "pm25": row["pm25"].astype(float),
+        "pm10": row["pm10"].astype(float),
+        "no2": row["no2"].astype(float),
+        "o3": row["o3"].astype(float),
+    })
 
     fg = get_or_create_raw_feature_group(fs)
 
@@ -564,605 +1023,15 @@ def write_raw_observation_to_hopsworks(
     )
 
     fg.insert(
-        row,
-        write_options={
-            "wait_for_job": False
-        }
-    )
-
-    log("Raw observation persisted successfully.")
-
-
-def read_raw_history_from_hopsworks(fs) -> pd.DataFrame:
-    log(
-        f"Reading raw history from Hopsworks "
-        f"({RAW_FEATURE_GROUP_NAME}, v{RAW_FEATURE_GROUP_VERSION})..."
-    )
-
-    fg = get_or_create_raw_feature_group(fs)
-
-    df = fg.read(
-        read_options={
-            "arrow_flight_config": {
-                "timeout": HOPSWORKS_READ_TIMEOUT
-            }
-        }
-    )
-
-    if df is None or df.empty:
-        return pd.DataFrame(
-            columns=RAW_COLUMNS
-        )
-
-    return clean_raw_history(df)
-
-
-def merge_histories(
-    hopsworks_history: pd.DataFrame,
-    local_history: pd.DataFrame,
-) -> pd.DataFrame:
-
-    frames = []
-
-    if not hopsworks_history.empty:
-        frames.append(
-            hopsworks_history
-        )
-
-    if not local_history.empty:
-        frames.append(
-            local_history
-        )
-
-    if not frames:
-        return pd.DataFrame(
-            columns=RAW_COLUMNS
-        )
-
-    merged = pd.concat(
-        frames,
-        ignore_index=True,
-    )
-
-    return clean_raw_history(
-        merged
-    )
-
-
-# ============================================================
-# WRITE RAW OBSERVATION TO HOPSWORKS
-# ============================================================
-
-def get_or_create_serving_feature_group(fs):
-    """Get/create a feature group for current 98-feature inference rows.
-
-    The existing ``aqi_features`` v3 group is a labeled training dataset
-    and requires ``id`` + ``target_aqi``. A brand-new observation does not
-    know its next-hour target yet, so it must not be written into that
-    labeled group with a fabricated target.
-    """
-
-    try:
-        fg = fs.get_feature_group(
-            name="aqi_serving_features",
-            version=1,
-        )
-
-        if fg is not None:
-            return fg
-
-    except Exception:
-        pass
-
-    return fs.create_feature_group(
-        name="aqi_serving_features",
-        version=1,
-        description=(
-            "Karachi AQI serving features: the exact 98 feature schema "
-            "used by the production Random Forest model, without a "
-            "future target."
-        ),
-        primary_key=["id"],
-        event_time="timestamp",
-        online_enabled=True,
-        time_travel_format="DELTA",
-    )
-
-
-def write_serving_feature_row(
-    fs,
-    feature_row: pd.DataFrame,
-    current_row: pd.Series,
-    timestamp: pd.Timestamp,
-) -> None:
-    """Write one current, unlabeled 98-feature inference row."""
-
-    timestamp = pd.to_datetime(
-        timestamp,
-        utc=True,
-    )
-
-    # Deterministic integer identifier: one ID per UTC hour.
-    feature_id = int(
-        timestamp.timestamp() // 3600
-    )
-
-    output = feature_row.copy()
-
-    output.insert(
-        0,
-        "id",
-        feature_id,
-    )
-
-    output.insert(
-        1,
-        "timestamp",
-        timestamp,
-    )
-
-    output.insert(
-        2,
-        "current_aqi",
-        float(current_row["aqi"]),
-    )
-
-    serving_columns = [
-        "id",
-        "timestamp",
-        "current_aqi",
-    ] + FEATURE_COLUMNS
-
-    output = output[serving_columns]
-
-    # Avoid inserting the same deterministic hourly observation twice.
-    try:
-        fg = get_or_create_serving_feature_group(fs)
-    except Exception:
-        raise
-
-    try:
-        fg.read(
-            start_time=timestamp,
-            end_time=timestamp + pd.Timedelta(minutes=1),
-            read_options={
-                "arrow_flight_config": {
-                    "timeout": HOPSWORKS_READ_TIMEOUT
-                }
-            },
-        )
-        already_exists = True
-    except Exception:
-        already_exists = False
-
-    if already_exists:
-        log(
-            f"Serving feature row already exists for {timestamp}; "
-            "skipping duplicate insert."
-        )
-        return
-
-    log(
-        f"Writing 98-feature serving row for {timestamp}..."
-    )
-
-    fg.insert(
         output,
-        storage="online",
+        write_options={
+            "wait_for_job": False,
+        },
     )
 
     log(
-        "98-feature serving row written successfully."
+        "Hopsworks raw observation submitted successfully."
     )
-
-# ============================================================
-# CONTIGUOUS HOURLY HISTORY
-# ============================================================
-
-def check_contiguous_history(
-    history: pd.DataFrame,
-    timestamp: pd.Timestamp,
-) -> tuple[bool, str]:
-
-    if history.empty:
-        return False, "No historical observations are available."
-
-    history = clean_raw_history(
-        history
-    )
-
-    before = history[
-        history["timestamp"] < timestamp
-    ].copy()
-
-    if len(before) < 24:
-        return (
-            False,
-            "Fewer than 24 prior observations are available."
-        )
-
-    # We need 24 actual hourly steps immediately before the current
-    # timestamp. Never fabricate missing rows.
-    required = before.tail(24)
-
-    expected = pd.date_range(
-        end=timestamp - pd.Timedelta(hours=1),
-        periods=24,
-        freq="1h",
-        tz="UTC",
-    )
-
-    actual = pd.DatetimeIndex(
-        required["timestamp"]
-    ).sort_values()
-
-    expected = pd.DatetimeIndex(
-        expected
-    )
-
-    if len(actual) != len(expected) or not (
-        actual.to_numpy() == expected.to_numpy()
-    ).all():
-        return (
-            False,
-            "The preceding 24 hours are not contiguous. "
-            "The pipeline will not fabricate missing observations."
-        )
-
-    return True, "24-hour history is contiguous."
-
-
-# ============================================================
-# 98-FEATURE ENGINEERING
-# ============================================================
-
-def build_98_feature_row(
-    history: pd.DataFrame,
-    current_row: pd.Series,
-) -> pd.DataFrame:
-
-    history = clean_raw_history(
-        history
-    )
-
-    timestamp = pd.to_datetime(
-        current_row["timestamp"],
-        utc=True,
-    )
-
-    working = pd.concat(
-        [
-            history,
-            pd.DataFrame(
-                [{
-                    "timestamp": timestamp,
-                    "aqi": float(current_row["aqi"]),
-                    "pm25": float(current_row["pm25"]),
-                    "pm10": float(current_row["pm10"]),
-                    "no2": float(current_row["no2"]),
-                    "o3": float(current_row["o3"]),
-                }]
-            ),
-        ],
-        ignore_index=True,
-    )
-
-    working = clean_raw_history(
-        working
-    )
-
-    current_matches = working.index[
-        working["timestamp"] == timestamp
-    ]
-
-    if len(current_matches) != 1:
-        raise RuntimeError(
-            "Could not identify exactly one current observation."
-        )
-
-    current_index = int(
-        current_matches[0]
-    )
-
-    ts = working.loc[
-        current_index,
-        "timestamp",
-    ]
-
-    hour = int(ts.hour)
-    dow = int(ts.dayofweek)
-    day_of_month = int(ts.day)
-    month = int(ts.month)
-    week_of_year = int(
-        ts.isocalendar().week
-    )
-
-    row = {
-        "pm25": working.loc[current_index, "pm25"],
-        "pm10": working.loc[current_index, "pm10"],
-        "no2": working.loc[current_index, "no2"],
-        "o3": working.loc[current_index, "o3"],
-
-        "hour": hour,
-        "day_of_week": dow,
-        "day_of_month": day_of_month,
-        "month": month,
-        "week_of_year": week_of_year,
-
-        "is_weekend": int(dow in [5, 6]),
-        "is_morning": int(6 <= hour <= 11),
-        "is_afternoon": int(12 <= hour <= 17),
-        "is_evening": int(18 <= hour <= 23),
-        "is_night": int(0 <= hour <= 5),
-
-        "hour_sin": np.sin(
-            2 * np.pi * hour / 24
-        ),
-        "hour_cos": np.cos(
-            2 * np.pi * hour / 24
-        ),
-
-        "dow_sin": np.sin(
-            2 * np.pi * dow / 7
-        ),
-        "dow_cos": np.cos(
-            2 * np.pi * dow / 7
-        ),
-
-        "month_sin": np.sin(
-            2 * np.pi * month / 12
-        ),
-        "month_cos": np.cos(
-            2 * np.pi * month / 12
-        ),
-    }
-
-    lag_hours = [
-        1,
-        2,
-        3,
-        6,
-        12,
-        24,
-    ]
-
-    pollutants = [
-        "pm25",
-        "pm10",
-        "no2",
-        "o3",
-    ]
-
-    # ----------------------------
-    # LAGS
-    # ----------------------------
-
-    for pollutant in pollutants:
-
-        for lag in lag_hours:
-
-            idx = current_index - lag
-
-            if idx < 0:
-                raise RuntimeError(
-                    f"Insufficient history for "
-                    f"{pollutant}_lag_{lag}h."
-                )
-
-            row[
-                f"{pollutant}_lag_{lag}h"
-            ] = working.loc[
-                idx,
-                pollutant,
-            ]
-
-    for lag in lag_hours:
-
-        idx = current_index - lag
-
-        if idx < 0:
-            raise RuntimeError(
-                f"Insufficient history for aqi_lag_{lag}h."
-            )
-
-        row[
-            f"aqi_lag_{lag}h"
-        ] = working.loc[
-            idx,
-            "aqi",
-        ]
-
-    # ----------------------------
-    # ROLLING FEATURES
-    # ----------------------------
-
-    for pollutant in pollutants:
-
-        previous_values = (
-            working[pollutant]
-            .shift(1)
-        )
-
-        for window in [
-            3,
-            6,
-            12,
-            24,
-        ]:
-
-            start = (
-                current_index
-                - window
-            )
-
-            values = previous_values.iloc[
-                max(0, start):
-                current_index
-            ]
-
-            if len(values) != window:
-                raise RuntimeError(
-                    f"Insufficient history for "
-                    f"{pollutant} rolling {window}h."
-                )
-
-            row[
-                f"{pollutant}_rolling_mean_{window}h"
-            ] = values.mean()
-
-            row[
-                f"{pollutant}_rolling_std_{window}h"
-            ] = values.std()
-
-    previous_aqi = (
-        working["aqi"]
-        .shift(1)
-    )
-
-    for window in [
-        3,
-        6,
-        12,
-        24,
-    ]:
-
-        values = previous_aqi.iloc[
-            current_index - window:
-            current_index
-        ]
-
-        if len(values) != window:
-            raise RuntimeError(
-                f"Insufficient history for "
-                f"aqi rolling {window}h."
-            )
-
-        row[
-            f"aqi_rolling_mean_{window}h"
-        ] = values.mean()
-
-        row[
-            f"aqi_rolling_std_{window}h"
-        ] = values.std()
-
-    # ----------------------------
-    # RATIOS
-    # ----------------------------
-
-    prev = current_index - 1
-    prev2 = current_index - 2
-
-    if prev < 0 or prev2 < 0:
-        raise RuntimeError(
-            "At least two previous observations are required "
-            "for one-hour change features."
-        )
-
-    prev_pm25 = working.loc[
-        prev,
-        "pm25",
-    ]
-
-    prev_pm10 = working.loc[
-        prev,
-        "pm10",
-    ]
-
-    prev_no2 = working.loc[
-        prev,
-        "no2",
-    ]
-
-    prev_o3 = working.loc[
-        prev,
-        "o3",
-    ]
-
-    row["pm25_pm10_ratio"] = (
-        prev_pm25 / prev_pm10
-        if prev_pm10 != 0
-        else np.nan
-    )
-
-    row["pm10_pm25_ratio"] = (
-        prev_pm10 / prev_pm25
-        if prev_pm25 != 0
-        else np.nan
-    )
-
-    row["pm25_no2_ratio"] = (
-        prev_pm25 / prev_no2
-        if prev_no2 != 0
-        else np.nan
-    )
-
-    row["o3_no2_ratio"] = (
-        prev_o3 / prev_no2
-        if prev_no2 != 0
-        else np.nan
-    )
-
-    row["pm25_change_1h"] = (
-        working.loc[prev, "pm25"]
-        - working.loc[prev2, "pm25"]
-    )
-
-    row["pm10_change_1h"] = (
-        working.loc[prev, "pm10"]
-        - working.loc[prev2, "pm10"]
-    )
-
-    row["no2_change_1h"] = (
-        working.loc[prev, "no2"]
-        - working.loc[prev2, "no2"]
-    )
-
-    row["o3_change_1h"] = (
-        working.loc[prev, "o3"]
-        - working.loc[prev2, "o3"]
-    )
-
-    result = pd.DataFrame(
-        [row]
-    )
-
-    missing = [
-        c
-        for c in FEATURE_COLUMNS
-        if c not in result.columns
-    ]
-
-    if missing:
-        raise RuntimeError(
-            "98-feature construction failed. Missing: "
-            + ", ".join(missing)
-        )
-
-    result = result[
-        FEATURE_COLUMNS
-    ]
-
-    result = result.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-    if result.isna().any().any():
-        missing_values = result.columns[
-            result.isna().any()
-        ].tolist()
-
-        raise RuntimeError(
-            "98-feature row contains NaN values in: "
-            + ", ".join(missing_values)
-        )
-
-    return result
-
-
-# ============================================================
-# MODEL FEATURE GROUP
-# ============================================================
 
 
 # ============================================================
@@ -1171,195 +1040,193 @@ def build_98_feature_row(
 
 def run_pipeline() -> int:
 
-    log("Starting hourly AQI feature pipeline.")
+    log(
+        "Starting hourly AQI feature pipeline "
+        "(final 163-feature version)."
+    )
 
     require_environment()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    # --------------------------------------------------------
+    # 1. Live OpenWeather observation
+    # --------------------------------------------------------
+
+    weather, pollution = fetch_openweather_observation()
+
+    current = normalize_current_observation(
+        weather,
+        pollution,
     )
 
-    # ----------------------------------------
-    # 1. Fetch external observation
-    # ----------------------------------------
-
-    weather, pollution = (
-        fetch_openweather_observation()
-    )
-
-    current_row, weather_info = (
-        normalize_current_observation(
-            weather,
-            pollution,
-        )
-    )
-
-    current_timestamp = pd.to_datetime(
-        current_row.iloc[0]["timestamp"],
-        utc=True,
-    )
+    current_timestamp = pd.Timestamp(
+        current.iloc[0]["timestamp"]
+    ).tz_convert("UTC")
 
     log(
         "Current observation: "
         f"{current_timestamp} | "
-        f"AQI={current_row.iloc[0]['aqi']} | "
-        f"PM2.5={current_row.iloc[0]['pm25']:.2f} | "
-        f"PM10={current_row.iloc[0]['pm10']:.2f} | "
-        f"NO2={current_row.iloc[0]['no2']:.2f} | "
-        f"O3={current_row.iloc[0]['o3']:.2f}"
+        f"OpenWeather AQI={current.iloc[0]['openweather_aqi']:.0f} | "
+        f"PM2.5={current.iloc[0]['pm25']:.2f} | "
+        f"PM10={current.iloc[0]['pm10']:.2f} | "
+        f"NO2={current.iloc[0]['no2']:.2f} | "
+        f"O3={current.iloc[0]['o3']:.2f}"
     )
 
     log(
         "Weather: "
-        f"temp={weather_info['temperature_c']} C, "
-        f"humidity={weather_info['humidity_percent']}%, "
-        f"pressure={weather_info['pressure_hpa']} hPa, "
-        f"wind={weather_info['wind_speed_mps']} m/s"
+        f"temp={current.iloc[0]['temperature_2m']:.2f} C, "
+        f"humidity={current.iloc[0]['relative_humidity_2m']:.0f}%, "
+        f"pressure={current.iloc[0]['surface_pressure']:.0f} hPa, "
+        f"wind={current.iloc[0]['wind_speed_10m'] / 3.6:.2f} m/s"
     )
 
-    # ----------------------------------------
-    # 2. Connect to Hopsworks
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # 2. Update local live cache FIRST
+    # --------------------------------------------------------
 
-    _, fs = connect_hopsworks()
+    live_cache = load_live_cache()
 
-    # ----------------------------------------
-    # 3. Read existing raw history
-    # ----------------------------------------
+    live_cache = pd.concat(
+        [live_cache, current[LIVE_COLUMNS]],
+        ignore_index=True,
+    )
+
+    live_cache = save_live_cache(live_cache)
+
+    # --------------------------------------------------------
+    # 3. Build final 0-500/model history
+    # --------------------------------------------------------
 
     try:
-
-        hopsworks_history = (
-            read_raw_history_from_hopsworks(fs)
-        )
-
+        model_history = build_model_history(live_cache)
     except Exception as exc:
-
         log(
-            "WARNING: Could not read Hopsworks raw history: "
+            "WARNING: Could not build model history yet: "
             f"{exc}"
         )
+        model_history = None
 
-        hopsworks_history = pd.DataFrame(
-            columns=RAW_COLUMNS
-        )
+    if model_history is not None:
+        # Live 0-500 AQI, when it is genuinely calculable.
+        latest_model_row = model_history[
+            model_history["timestamp"] == current_timestamp
+        ]
 
-    local_history = (
-        load_local_raw_cache()
-    )
+        if (
+            not latest_model_row.empty
+            and pd.notna(latest_model_row.iloc[0]["aqi"])
+        ):
+            current_aqi_500 = float(
+                latest_model_row.iloc[0]["aqi"]
+            )
+            log(
+                f"Current model-scale AQI (0-500): "
+                f"{current_aqi_500:.0f}"
+            )
+        else:
+            current_aqi_500 = None
+            log(
+                "Current 0-500 AQI is not yet calculable from a "
+                "complete continuous averaging window."
+            )
 
-    history_before_current = merge_histories(
-        hopsworks_history,
-        local_history,
-    )
+        # ----------------------------------------------------
+        # 4. Build current 163-feature row only when valid
+        # ----------------------------------------------------
 
-    # ----------------------------------------
-    # 4. Update local raw-observation cache.
-    # ----------------------------------------
-    #
-    # The existing aqi_features v3 group is a labeled training dataset.
-    # We do NOT insert a current observation into it because its future
-    # target_aqi is not known yet.
+        if current_aqi_500 is not None:
+            contiguous, reason = check_contiguous_history(
+                model_history,
+                current_timestamp,
+            )
 
-    history_before_current = clean_raw_history(
-        history_before_current
-    )
+            if contiguous:
+                # Replace the latest row with the current complete live state.
+                current_feature_state = model_history[
+                    model_history["timestamp"] == current_timestamp
+                ]
 
-    combined_history = merge_histories(
-        history_before_current,
-        current_row,
-    )
+                feature_row = build_recursive_163_features(
+                    current_feature_state.append(
+                        # pandas append removed in modern pandas; this branch
+                        # is never used because the state is already present.
+                        {},
+                        ignore_index=True,
+                    )
+                    if False else model_history[
+                        model_history["timestamp"] <= current_timestamp
+                    ],
+                    current_timestamp,
+                )
 
-    save_local_raw_cache(
-        combined_history
-    )
+                save_latest_feature_row(
+                    feature_row,
+                    current_timestamp,
+                )
 
-    # Persist the current raw observation so the next hourly run
-    # can reuse it from Hopsworks.
-    write_raw_observation_to_hopsworks(
-        fs,
-        current_row,
-    )
+                log(
+                    f"Constructed exactly {feature_row.shape[1]} "
+                    "final model features."
+                )
+                log(
+                    "163-feature local inference row is ready."
+                )
+            else:
+                log(
+                    "163-feature serving row deferred: "
+                    + reason
+                )
+        else:
+            log(
+                "163-feature serving row deferred until a complete "
+                "0-500 AQI averaging window exists."
+            )
 
-    # ----------------------------------------
-    # 5. Check whether 98 features are possible
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # 5. Best-effort Hopsworks persistence
+    # --------------------------------------------------------
 
-    contiguous, reason = (
-        check_contiguous_history(
-            history_before_current,
-            current_timestamp,
-        )
-    )
+    if HOPSWORKS_API_KEY:
+        try:
+            fs = connect_hopsworks()
 
-    if not contiguous:
+            try:
+                write_raw_observation_to_hopsworks(
+                    fs,
+                    current,
+                )
+            except Exception as exc:
+                log(
+                    "WARNING: Hopsworks raw write/materialization "
+                    f"failed; local cache remains authoritative: {exc}"
+                )
 
+        except Exception as exc:
+            log(
+                "WARNING: Hopsworks unavailable; "
+                f"continuing with local cache only: {exc}"
+            )
+    else:
         log(
-            "RAW COLLECTION SUCCESS."
+            "WARNING: HOPSWORKS_API_KEY is not configured; "
+            "using local cache only."
         )
-
-        log(
-            "98-feature serving row not written yet: "
-            + reason
-        )
-
-        log(
-            "This is intentional. Missing historical observations "
-            "will not be fabricated."
-        )
-
-        return 0
-
-    # ----------------------------------------
-    # 6. Build exact 98 features for the current hour
-    # ----------------------------------------
-
-    feature_row = build_98_feature_row(
-        combined_history,
-        current_row.iloc[0],
-    )
 
     log(
-        f"Constructed exactly {feature_row.shape[1]} model features."
-    )
-
-    # ----------------------------------------
-    # 7. Store unlabeled current features
-    # ----------------------------------------
-    #
-    # target_aqi is deliberately absent here because the next-hour AQI
-    # is not known at the current timestamp. The training/backfill
-    # pipeline will construct labeled rows retrospectively.
-
-    write_serving_feature_row(
-        fs,
-        feature_row,
-        current_row.iloc[0],
-        current_timestamp,
-    )
-
-    log(
-        "PIPELINE SUCCESS: raw cache updated + "
-        "98-feature serving row stored."
+        "PIPELINE SUCCESS: local live cache updated; "
+        "Hopsworks persistence was best-effort."
     )
 
     return 0
 
 
 if __name__ == "__main__":
-
     try:
-        raise SystemExit(
-            run_pipeline()
-        )
-
+        raise SystemExit(run_pipeline())
     except KeyboardInterrupt:
         log("Pipeline interrupted.")
         raise SystemExit(130)
-
     except Exception as exc:
-        log(
-            f"PIPELINE FAILED: {exc}"
-        )
+        log(f"PIPELINE FAILED: {exc}")
         raise SystemExit(1)

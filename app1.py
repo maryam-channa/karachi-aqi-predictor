@@ -816,6 +816,149 @@ def fetch_current_weather():
 
 
 # ============================================================
+# LIVE CURRENT AIR QUALITY
+# ============================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_current_air_quality():
+    """Fetch the latest OpenWeather air-pollution observation."""
+
+    if not OPENWEATHER_API_KEY:
+        return None
+
+    url = (
+        "https://api.openweathermap.org/data/2.5/air_pollution"
+        f"?lat={LAT}"
+        f"&lon={LON}"
+        f"&appid={OPENWEATHER_API_KEY}"
+    )
+
+    try:
+        response = _openweather_get(
+            url,
+            timeout_seconds=45,
+            attempts=2,
+        )
+
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            if data.get("list"):
+                return data
+
+    except requests.RequestException:
+        pass
+
+    return None
+
+
+def _linear_aqi(concentration, c_low, c_high, i_low, i_high):
+    """Linearly interpolate an AQI value inside one breakpoint interval."""
+
+    if concentration is None or concentration < c_low or concentration > c_high:
+        return None
+
+    return i_low + (i_high - i_low) * (concentration - c_low) / (c_high - c_low)
+
+
+def calculate_live_aqi_0_500(components):
+    """
+    Convert the live PM2.5/PM10 concentrations into the dashboard's 0-500
+    operational AQI scale. OpenWeather's native 1-5 ``main.aqi`` value is
+    deliberately not used as the ML baseline because the production model
+    operates on the project's 0-500 AQI scale.
+
+    The live value is an operational estimate based on the dominant
+    particulate sub-index; it is not presented as an official agency AQI.
+    """
+
+    pm25 = _safe_float(components.get("pm2_5"))
+    pm10 = _safe_float(components.get("pm10"))
+    candidates = []
+
+    pm25_breakpoints = [
+        (0.0, 12.0, 0, 50),
+        (12.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 150.4, 151, 200),
+        (150.5, 250.4, 201, 300),
+        (250.5, 350.4, 301, 400),
+        (350.5, 500.4, 401, 500),
+    ]
+
+    if pm25 is not None:
+        value = min(max(pm25, 0.0), 500.4)
+        for c_low, c_high, i_low, i_high in pm25_breakpoints:
+            if c_low <= value <= c_high:
+                candidates.append(
+                    _linear_aqi(value, c_low, c_high, i_low, i_high)
+                )
+                break
+
+    pm10_breakpoints = [
+        (0.0, 54.0, 0, 50),
+        (55.0, 154.0, 51, 100),
+        (155.0, 254.0, 101, 150),
+        (255.0, 354.0, 151, 200),
+        (355.0, 424.0, 201, 300),
+        (425.0, 504.0, 301, 400),
+        (505.0, 604.0, 401, 500),
+    ]
+
+    if pm10 is not None:
+        value = min(max(pm10, 0.0), 604.0)
+        for c_low, c_high, i_low, i_high in pm10_breakpoints:
+            if c_low <= value <= c_high:
+                candidates.append(
+                    _linear_aqi(value, c_low, c_high, i_low, i_high)
+                )
+                break
+
+    valid = [
+        float(v)
+        for v in candidates
+        if v is not None and np.isfinite(v)
+    ]
+
+    if not valid:
+        return None
+
+    return float(np.clip(max(valid), 0.0, 500.0))
+
+
+def extract_live_air_observation(current_air_data):
+    """Normalize the latest OpenWeather air record for live inference."""
+
+    if not current_air_data or not current_air_data.get("list"):
+        return None
+
+    entry = current_air_data["list"][0]
+    components = entry.get("components", {})
+
+    required = ["pm2_5", "pm10", "no2", "o3"]
+    if any(_safe_float(components.get(name)) is None for name in required):
+        return None
+
+    timestamp = pd.to_datetime(
+        entry.get("dt"),
+        unit="s",
+        utc=True,
+    ).floor("h")
+
+    live_aqi = calculate_live_aqi_0_500(components)
+    if live_aqi is None:
+        return None
+
+    return {
+        "timestamp": timestamp,
+        "aqi": live_aqi,
+        "pm25": float(components["pm2_5"]),
+        "pm10": float(components["pm10"]),
+        "no2": float(components["no2"]),
+        "o3": float(components["o3"]),
+    }
+
+
+# ============================================================
 # AQI FORECAST
 # ============================================================
 
@@ -1369,6 +1512,7 @@ def process_recursive_72h_forecast(
     model,
     imputer,
     feature_columns,
+    live_air_observation=None,
 ):
     """Generate 72 recursive hourly predictions and aggregate them into 3 days."""
 
@@ -1383,27 +1527,20 @@ def process_recursive_72h_forecast(
         .reset_index(drop=True)
     )
 
-    # Start from the most recent local 0–500 AQI observation.
+    # Prefer the live OpenWeather observation as the operational starting point.
+    # Fall back to the local 0–500 observation only when live air data is unavailable.
     latest = history.iloc[-1].copy()
-    latest_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
+    historical_latest_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
 
-    # Use current OpenWeather pollutants when available, while keeping
-    # the 0–500 AQI from the historical dataset as the recursive starting value.
-    if forecast_data and forecast_data.get("list"):
-        first_api = sorted(forecast_data["list"], key=lambda x: x.get("dt", 0))[0]
-        components = first_api.get("components", {})
-    else:
-        components = {}
-
-    latest_aqi_500 = float(latest["aqi"])
-
-    current_values = {
-        "timestamp": latest_timestamp,
-        "aqi": latest_aqi_500,
-        "pm25": float(components.get("pm2_5", latest["pm25"])),
-        "pm10": float(components.get("pm10", latest["pm10"])),
-        "no2": float(components.get("no2", latest["no2"])),
-        "o3": float(components.get("o3", latest["o3"])),
+    if live_air_observation is not None:
+        latest_timestamp = pd.Timestamp(live_air_observation["timestamp"]).tz_convert("UTC")
+        current_values = {
+            "timestamp": latest_timestamp,
+            "aqi": float(live_air_observation["aqi"]),
+            "pm25": float(live_air_observation["pm25"]),
+            "pm10": float(live_air_observation["pm10"]),
+            "no2": float(live_air_observation["no2"]),
+            "o3": float(live_air_observation["o3"]),
         "temperature_2m": float(
             current_weather.get("main", {}).get("temp", latest["temperature_2m"])
             if current_weather else latest["temperature_2m"]
@@ -1426,7 +1563,8 @@ def process_recursive_72h_forecast(
         ),
     }
 
-    # Replace the same timestamp with the freshest current inputs.
+    # Remove the stale final historical row and append the live observation.
+    history = history[history["timestamp"] != historical_latest_timestamp].copy()
     history = history[history["timestamp"] != latest_timestamp].copy()
     history = pd.concat([history, pd.DataFrame([current_values])], ignore_index=True)
     history = history.sort_values("timestamp").reset_index(drop=True)
@@ -2232,6 +2370,8 @@ def main():
     with st.spinner("Preparing the latest Karachi air-quality forecast..."):
         model, imputer, model_features = load_recursive_72h_model()
         current_weather = fetch_current_weather()
+        current_air_data = fetch_current_air_quality()
+        live_air_observation = extract_live_air_observation(current_air_data)
         forecast_data = fetch_aqi_forecast()
         historical_data = fetch_historical_feature_data()
 
@@ -2254,6 +2394,7 @@ def main():
         model,
         imputer,
         model_features,
+        live_air_observation=live_air_observation,
     )
 
     if forecast_result is None:
@@ -2266,6 +2407,15 @@ def main():
             "The latest pollutant values are being held constant for future hours."
         )
 
+    if live_air_observation is not None:
+        st.caption(
+            "Live AQI baseline uses current OpenWeather pollutant concentrations on the dashboard's 0–500 operational scale; OpenWeather's native 1–5 AQI index is not used for the ML baseline."
+        )
+    else:
+        st.warning(
+            "Live air-quality data was unavailable, so the latest local AQI observation is being used as the fallback baseline."
+        )
+
     predictions = forecast_result["daily_predictions"]
     forecast_dates = forecast_result["forecast_dates"]
     daily_min = forecast_result["daily_min"]
@@ -2274,12 +2424,23 @@ def main():
     shap_features = forecast_result["shap_features"]
 
     latest = historical_data.iloc[-1]
-    current_aqi = float(latest["aqi"])
-    current_pm25 = float(latest["pm25"])
-    current_pm10 = float(latest["pm10"])
-    current_no2 = float(latest["no2"])
-    current_o3 = float(latest["o3"])
-    last_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
+
+    if live_air_observation is not None:
+        current_aqi = float(live_air_observation["aqi"])
+        current_pm25 = float(live_air_observation["pm25"])
+        current_pm10 = float(live_air_observation["pm10"])
+        current_no2 = float(live_air_observation["no2"])
+        current_o3 = float(live_air_observation["o3"])
+        last_timestamp = pd.Timestamp(live_air_observation["timestamp"]).tz_convert("UTC")
+        current_data_label = "Live OpenWeather air-quality snapshot"
+    else:
+        current_aqi = float(latest["aqi"])
+        current_pm25 = float(latest["pm25"])
+        current_pm10 = float(latest["pm10"])
+        current_no2 = float(latest["no2"])
+        current_o3 = float(latest["o3"])
+        last_timestamp = pd.Timestamp(latest["timestamp"]).tz_convert("UTC")
+        current_data_label = "Latest available local observation"
 
     current_category = get_aqi_category(current_aqi)
     current_color = get_aqi_color(current_aqi)
@@ -2314,7 +2475,7 @@ def main():
 
     render_section(
         "Live AQI Command Center",
-        "Current conditions • latest verified local observation",
+        "Current conditions • live operational snapshot",
     )
 
     left, middle, right = st.columns([0.9, 1.1, 1.1], gap="medium")
@@ -2330,7 +2491,7 @@ def main():
                     {current_category}
                 </div>
                 <div class="micro">
-                    Last observed: {last_timestamp.strftime("%d %b %Y • %H:%M UTC")}
+                    {current_data_label}: {last_timestamp.strftime("%d %b %Y • %H:%M UTC")}
                 </div>
             </div>
             """,
@@ -2715,7 +2876,7 @@ def main():
     # --------------------------------------------------------
     render_section(
         "Historical AQI Intelligence",
-        "30-day trend • 2-year category distribution • pollutant/weather relationships",
+        "Historical context • 30-day trend • 2-year category distribution • pollutant/weather relationships",
     )
 
     history_cols = st.columns(2, gap="medium")
