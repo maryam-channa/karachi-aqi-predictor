@@ -2409,7 +2409,6 @@ def main():
 
     if live_air_observation is not None:
         st.caption(
-            "Live AQI baseline uses current OpenWeather pollutant concentrations on the dashboard's 0–500 operational scale; OpenWeather's native 1–5 AQI index is not used for the ML baseline."
         )
     else:
         st.warning(
