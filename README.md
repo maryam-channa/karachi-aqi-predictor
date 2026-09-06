@@ -8,7 +8,7 @@
 https://karachi-aqi-intelligence.streamlit.app/
 
 📄 **Final Project Report:**
-[View Final Project Report (PDF)](report/Karachi_AQI_Predictor_Final_Project_Report.pdf)
+[View Final Project Report (PDF)](report/Karachi_AQI_Predictor_10Pearls_Internship_Final_Report.pdf)
 
 💻 **GitHub Repository:**
 https://github.com/maryam-channa/karachi-aqi-predictor
