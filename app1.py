@@ -2408,8 +2408,7 @@ def main():
         )
 
     if live_air_observation is not None:
-        st.caption(
-        )
+        pass
     else:
         st.warning(
             "Live air-quality data was unavailable, so the latest local AQI observation is being used as the fallback baseline."
